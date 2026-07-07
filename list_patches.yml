@@ -1,0 +1,848 @@
+---
+# list_patches.yml
+#
+# Flask passes report_dir as extra-var → /tmp/patch_jobs/<job_id>/reports
+# Never hardcode any path — use {{ report_dir }} throughout.
+#
+# Compatibility: Ubuntu / Debian / Kali (apt) and RHEL / CentOS / AlmaLinux /
+# Rocky / Amazon Linux / Oracle Linux (yum, dnf, or dnf5).
+#
+# DESIGN NOTES
+# -----------------------------------------------------------------------
+# 1. All per-package metadata lookups (current/new version, size,
+#    description, security status, CVEs) are done with BULK calls instead
+#    of 4-6 shell calls PER PACKAGE in an Ansible loop. On a host with
+#    100+ pending updates that turns ~500 subprocess calls into ~5.
+#
+# 2. RHEL-family hosts get an explicit "always refresh metadata" step
+#    (mirrors the Debian `cache_valid_time: 0` behaviour) with its own
+#    timeout, so a slow `dnf check-update` is visible/bounded instead of
+#    hiding inside one giant task.
+#
+# 3. Package manager detection uses `command -v dnf5|dnf|yum` instead of
+#    `ansible_pkg_mgr`, which avoids tasks being silently skipped on newer
+#    AlmaLinux/RHEL where the fact may report "dnf5".
+#
+# 4. `apt-get -s dist-upgrade` (not plain `upgrade`) is used so kernel
+#    meta-package transitions and dependency-driven new installs are
+#    included in the patch list.
+#
+# 5. VERSION AUTHORITY — FIX #1
+#      - Debian/Ubuntu: new_version and current_version are now sourced
+#        from `apt-cache policy` (authoritative, honours APT pinning,
+#        backports, and all preference files) instead of `apt-cache show`
+#        (which could return a pinned/wrong stanza).
+#        `apt-cache show` is still used only for Description/Origin/Section.
+#      - RHEL family: version from `dnf info`, unchanged.
+#
+# 6. SIZE FIELD — FIX #2
+#      size_kb is the estimated unpacked size of the candidate package
+#      (from apt-cache show Installed-Size / dnf info Size). It is NOT
+#      download size. Non-numeric chars are stripped; field is documented
+#      as an estimate. An authoritative pre-install size requires
+#      `apt-get -s install` per package (too expensive at scale).
+#
+# 7. SECURITY DETECTION
+#      - Debian/Ubuntu: package is "Security" if its candidate version
+#        comes from a "-security" pocket (via `apt-cache madison`), OR it
+#        matches known security-relevant package names, OR its apt Section
+#        contains "security". Kali has no "-security" pocket; the pocket
+#        check is suppressed there. A `security_source` confidence field
+#        is included: "apt-security-pocket" | "package-name-heuristic" |
+#        "section-heuristic" | "none".
+#      - RHEL family: "Security" if it appears in
+#        `dnf/yum updateinfo list security`. CVEs from a single bulk
+#        `updateinfo info security` call. Amazon/Oracle Linux skip
+#        updateinfo CVE parsing (format not stable on those distros).
+#
+# 8. CHECK-UPDATE PARSER — FIX #3
+#      Section-state-aware parser explicitly handles: repo loading lines,
+#      "Obsoleting Packages" blocks, modular stream suffixes (perl:5.32),
+#      Security: section markers, and epoch-prefixed NEVRAs.
+#
+# 9. UPDATEINFO PARSER — FIX #4
+#      Case-insensitive, multi-delimiter CVE/package parser handles:
+#      "CVE :", "CVEs :", multi-value continuation lines, both "Updated
+#      Packages" and "Affected Packages" / "Fixed Packages" headers, and
+#      both === and "Name :" / "Update ID :" as block separators. Covers
+#      yum-plugin-security, dnf 4.x, and dnf5 output formats.
+#
+# 10. DISTRO AWARENESS — FIX #6
+#      Both ansible_os_family AND ansible_distribution are passed to the
+#      scanner. Kali suppresses the -security pocket check. Amazon/Oracle
+#      skip updateinfo CVE parsing. Ubuntu retains phased-update handling.
+#
+# 11. APT::Get::Always-Include-Phased-Updates=true so Ubuntu's per-machine
+#      phased-rollout mechanism doesn't hide available updates.
+#
+# 12. The scanner script always prints a valid JSON array, even on
+#      unexpected errors, so the per-host report is always written.
+#
+# KNOWN LIMITATIONS (best-effort, not authoritative):
+#   - "Security" classification is heuristic for Debian (apt -security
+#     pocket / name patterns); not a substitute for USN-database-backed
+#     audit. The `security_source` field exposes confidence tier.
+#   - size_kb is estimated unpacked size, not download size.
+#   - SUSE/openSUSE (zypper) is not covered.
+#   - External CVE enrichment (OSV API / Ubuntu Security Notices API)
+#     should be done in the Flask post-scan layer, not here.
+#
+# Report schema:
+#   { hostname, ip, os, kernel, arch, scan_time, patch_count, patches[],
+#     scan_error }
+#   each patch: { name, current_version, new_version, size_kb,
+#                 description, origin, category, security_source, cves }
+
+- name: List Available Patches
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: yes
+  become: yes
+  vars:
+    # Fallback for standalone testing without Flask
+    report_dir:     "/tmp/patch_reports"
+    remote_report:  "/tmp/patch_report_{{ inventory_hostname }}.json"
+    remote_scanner: "/tmp/.patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
+
+    # Tunables
+    patch_detail_limit:   500    # max packages eligible for changelog/CVE lookups (Debian)
+    patch_fetch_cves:     true   # set false on air-gapped hosts (avoids apt-get changelog)
+    patch_scan_timeout:   900    # seconds; generous cap for metadata refresh + scan
+    patch_scanner_python: "/usr/bin/python3"
+
+  tasks:
+
+    # ── Ensure per-job report directory exists on controller ────────────────
+    - name: Create report_dir on controller
+      local_action:
+        module: file
+        path:  "{{ report_dir }}"
+        state: directory
+        mode:  "0755"
+      become: no
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Always refresh package metadata so the scan is accurate
+    # ───────────────────────────────────────────────────────────────────────
+    - name: "[Debian] Refresh apt cache — always, so post-patch scans are accurate"
+      apt:
+        update_cache: yes
+        cache_valid_time: 0      # MUST be 0; any other value returns stale lists
+        update_cache_retries: 3
+        update_cache_retry_max_delay: 5
+      when: ansible_os_family == "Debian"
+
+    - name: "[RedHat] Refresh package metadata — always, so post-patch scans are accurate"
+      shell: |
+        set -e
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q makecache
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+        LANG: C
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: rh_makecache
+      when: ansible_os_family == "RedHat"
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Initialize results (covers OS families we don't actively scan)
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Initialize scan results
+      set_fact:
+        all_patches: []
+        scan_error: ""
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Run the bulk patch scanner (Debian/Ubuntu/Kali or RHEL family)
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Scan for available patches
+      when: ansible_os_family in ['Debian', 'RedHat']
+      block:
+
+        - name: Copy patch scanner script to remote host
+          copy:
+            dest: "{{ remote_scanner }}"
+            mode: "0700"
+            content: |
+              {% raw %}
+              #!/usr/bin/env python3
+              """
+              patch_scanner.py  — v2 (all fixes applied)
+
+              Scans a host for available package updates (Debian/apt family or
+              RHEL/dnf/dnf5/yum family) and prints a JSON array of patch objects
+              to stdout.
+
+              Usage: patch_scanner.py <ansible_os_family> [ansible_distribution]
+
+              Fix #1  — apt-cache policy for authoritative version resolution
+              Fix #2  — size_kb sanitised and documented as estimated unpacked KB
+              Fix #3  — section-state-aware check-update parser (modular streams,
+                         Obsoleting block, epoch stripping)
+              Fix #4  — robust updateinfo CVE parser (case-insensitive, multi-
+                         delimiter, handles dnf / dnf5 / yum-plugin-security)
+              Fix #5  — security_source confidence tier field on every patch
+              Fix #6  — distro-aware branching (Kali pocket suppression,
+                         Amazon/Oracle updateinfo skip)
+
+              Always exits 0 and prints valid JSON (possibly "[]"), even on
+              unexpected errors, so the calling playbook can rely on parseable
+              output.
+              """
+
+              import json
+              import os
+              import re
+              import shutil
+              import subprocess
+              import sys
+
+              DETAIL_LIMIT = int(os.environ.get("PATCH_DETAIL_LIMIT", "500"))
+              FETCH_CVES   = os.environ.get("PATCH_FETCH_CVES", "1").lower() not in ("0", "false", "no")
+
+              ARCH_SUFFIX_RE = re.compile(
+                  r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
+              )
+              VER_REL_RE = re.compile(r"-[^-:]+-[^-:]+$")
+
+
+              def run(cmd, timeout=180):
+                  """Run a command; return (rc, stdout, stderr). Never raises."""
+                  try:
+                      proc = subprocess.run(
+                          cmd,
+                          capture_output=True,
+                          text=True,
+                          timeout=timeout,
+                          errors="replace",
+                      )
+                      return proc.returncode, proc.stdout, proc.stderr
+                  except FileNotFoundError:
+                      return 127, "", "command not found"
+                  except subprocess.TimeoutExpired:
+                      return 124, "", "timed out"
+                  except Exception as exc:  # noqa: BLE001
+                      return 1, "", str(exc)
+
+
+              # ═══════════════════════════════════════════════════════════════
+              # Debian / Ubuntu / Kali
+              # ═══════════════════════════════════════════════════════════════
+
+              DEB_KERNEL_RE = re.compile(
+                  r"^(linux-image|linux-headers|linux-modules|linux-generic|linux-virtual)",
+                  re.I,
+              )
+              DEB_SECURITY_NAME_RE = re.compile(
+                  r"^(openssl|openssh-server|openssh-client|libssl|libgnutls|libnss|gnupg|gnupg2)",
+                  re.I,
+              )
+              DEB_RUNTIME_RE = re.compile(
+                  r"^(python3?[0-9.\-]*|perl|ruby|php[0-9.\-]*|nodejs|npm|openjdk|java)",
+                  re.I,
+              )
+
+
+              # ── FIX #1: apt-cache policy for authoritative versions ──────────
+              def get_apt_policy(pkgs):
+                  """
+                  Returns {pkg: {'installed': ver, 'candidate': ver}}.
+
+                  apt-cache policy is the authoritative source for what apt will
+                  actually install — it honours APT pinning, backports, and all
+                  /etc/apt/preferences files. apt-cache show does NOT.
+                  """
+                  rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
+                  result = {}
+                  cur_pkg = None
+                  for line in out.splitlines():
+                      # Package name line ends with ':'
+                      m = re.match(r"^(\S+):$", line)
+                      if m:
+                          cur_pkg = m.group(1)
+                          result[cur_pkg] = {"installed": "unknown", "candidate": "unknown"}
+                          continue
+                      if cur_pkg:
+                          mi = re.match(r"\s+Installed:\s+(\S+)", line)
+                          mc = re.match(r"\s+Candidate:\s+(\S+)", line)
+                          if mi:
+                              v = mi.group(1)
+                              result[cur_pkg]["installed"] = "" if v == "(none)" else v
+                          if mc:
+                              v = mc.group(1)
+                              result[cur_pkg]["candidate"] = "" if v == "(none)" else v
+                  return result
+
+
+              def parse_apt_show(text):
+                  """
+                  Parse 'apt-cache show pkg1 pkg2 ...' output into
+                  {pkg: {field: value}}.
+
+                  Used ONLY for Description, Origin, Section, and Installed-Size
+                  (size estimate). NOT used for version resolution (see
+                  get_apt_policy above).
+
+                  Keeps the first stanza seen per package (highest-priority /
+                  candidate version is listed first by apt-cache).
+                  """
+                  result = {}
+                  stanza = {}
+                  cur_field = None
+                  pkg_name = None
+                  for line in text.splitlines():
+                      if line == "":
+                          if pkg_name and pkg_name not in result:
+                              result[pkg_name] = stanza
+                          stanza, cur_field, pkg_name = {}, None, None
+                          continue
+                      if line[:1] in (" ", "\t"):
+                          if cur_field:
+                              stanza[cur_field] = (
+                                  stanza.get(cur_field, "") + " " + line.strip()
+                              ).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          stanza[key] = val
+                          cur_field = key
+                          if key == "Package":
+                              pkg_name = val
+                  if pkg_name and pkg_name not in result:
+                      result[pkg_name] = stanza
+                  return result
+
+
+              def categorize_debian(pkg, section, is_security_pocket):
+                  """
+                  Returns (category, security_source) tuple.
+                  security_source encodes confidence tier (Fix #5).
+                  """
+                  if DEB_KERNEL_RE.match(pkg):
+                      return "Kernel", "none"
+                  if is_security_pocket:
+                      return "Security", "apt-security-pocket"
+                  if DEB_SECURITY_NAME_RE.match(pkg):
+                      return "Security", "package-name-heuristic"
+                  if "security" in section.lower():
+                      return "Security", "section-heuristic"
+                  if section.lower().startswith("libs"):
+                      return "Library", "none"
+                  if DEB_RUNTIME_RE.match(pkg):
+                      return "Runtime", "none"
+                  if re.search(r"admin|utils", section, re.I):
+                      return "System", "none"
+                  return "Application", "none"
+
+
+              def debian_cves(pkg, timeout=6):
+                  rc, out, _ = run(["apt-get", "changelog", pkg], timeout=timeout)
+                  if rc != 0:
+                      return ""
+                  cves = sorted(set(re.findall(r"CVE-\d{4}-\d+", out)))
+                  return ",".join(cves)
+
+
+              def scan_debian(distro=""):
+                  """
+                  distro: ansible_distribution value, e.g. "Ubuntu", "Debian", "Kali".
+                  Used for distro-specific branching (Fix #6).
+                  """
+                  is_kali = distro.lower() == "kali"
+
+                  # APT::Get::Always-Include-Phased-Updates=true: Ubuntu's phased-
+                  # rollout mechanism can hide an available update from this host
+                  # until its rollout % reaches it. For a full patch inventory we
+                  # want everything, not just what's been phased to this host.
+                  rc, out, _ = run(
+                      [
+                          "apt-get", "-s", "dist-upgrade",
+                          "-o", "Debug::NoLocking=true",
+                          "-o", "APT::Get::Always-Include-Phased-Updates=true",
+                      ],
+                      timeout=300,
+                  )
+                  pkgs = sorted(
+                      {
+                          line.split()[1]
+                          for line in out.splitlines()
+                          if line.startswith("Inst ") and len(line.split()) > 1
+                      }
+                  )
+                  if not pkgs:
+                      return []
+
+                  # FIX #1 — authoritative installed/candidate versions
+                  policy = get_apt_policy(pkgs)
+
+                  # apt-cache show: only for Description, Origin, Section, size estimate
+                  _, show_out, _ = run(
+                      ["apt-cache", "show", "--no-all-versions", *pkgs],
+                      timeout=120,
+                  )
+                  candidates = parse_apt_show(show_out)
+
+                  # madison for security-pocket detection (suppressed on Kali — Fix #6)
+                  madison = {}
+                  if not is_kali:
+                      _, madison_out, _ = run(["apt-cache", "madison", *pkgs], timeout=60)
+                      for line in madison_out.splitlines():
+                          cols = [c.strip() for c in line.split("|")]
+                          if len(cols) >= 3:
+                              madison.setdefault(cols[0], []).append((cols[1], cols[2]))
+
+                  results = []
+                  cve_lookups = 0
+                  for pkg in pkgs:
+                      pol  = policy.get(pkg, {})
+                      cand = candidates.get(pkg, {})
+
+                      # FIX #1 — use policy for version, not apt-cache show
+                      cur_ver = pol.get("installed", "unknown") or "unknown"
+                      new_ver = pol.get("candidate", "unknown") or "unknown"
+
+                      # FIX #2 — sanitise size; strip non-numeric chars; document as estimate
+                      raw_size = cand.get("Installed-Size", "0") or "0"
+                      size_kb  = re.sub(r"[^\d]", "", str(raw_size)) or "0"
+
+                      desc    = cand.get("Description-en") or cand.get("Description") or ""
+                      origin  = cand.get("Origin", "Unknown")
+                      section = cand.get("Section", "")
+
+                      # Security-pocket check (Kali: is_kali suppresses this — Fix #6)
+                      is_security_pocket = (not is_kali) and any(
+                          "-security" in src
+                          and (new_ver in ("unknown", "") or ver == new_ver)
+                          for ver, src in madison.get(pkg, [])
+                      )
+
+                      # FIX #5 — category + security_source confidence tier
+                      category, security_source = categorize_debian(
+                          pkg, section, is_security_pocket
+                      )
+
+                      cves = ""
+                      if (
+                          category == "Security"
+                          and FETCH_CVES
+                          and cve_lookups < DETAIL_LIMIT
+                      ):
+                          cve_lookups += 1
+                          cves = debian_cves(pkg)
+
+                      results.append(
+                          {
+                              "name":            pkg,
+                              "current_version": cur_ver,
+                              "new_version":     new_ver,
+                              "size_kb":         size_kb,   # estimated unpacked KB
+                              "description":     desc[:120],
+                              "origin":          origin,
+                              "category":        category,
+                              "security_source": security_source,  # FIX #5
+                              "cves":            cves,
+                          }
+                      )
+                  return results
+
+
+              # ═══════════════════════════════════════════════════════════════
+              # RHEL / CentOS / AlmaLinux / Rocky / Amazon / Oracle
+              # ═══════════════════════════════════════════════════════════════
+
+              RH_KERNEL_RE  = re.compile(r"^kernel",                      re.I)
+              RH_RUNTIME_RE = re.compile(
+                  r"^(python[0-9]*|perl|ruby|php|nodejs|npm|java|jdk)",   re.I
+              )
+
+              # Distros where updateinfo CVE parsing is unreliable (Fix #6)
+              RH_SKIP_UPDATEINFO_DISTROS = {"amazon", "amazonlinux", "oraclelinux", "oracle"}
+
+
+              def strip_nevra(nevra):
+                  """Strip arch suffix, version-release, and leading epoch from NEVRA."""
+                  name = ARCH_SUFFIX_RE.sub("", nevra)
+                  name = VER_REL_RE.sub("", name)
+                  name = re.sub(r"^\d+:", "", name)   # strip leading epoch (Fix #3)
+                  # Strip modular stream suffix: perl:5.32/default → perl (Fix #3)
+                  name = name.split(":")[0]
+                  return name
+
+
+              # ── FIX #3: section-state-aware check-update parser ─────────────
+              def parse_check_update(text):
+                  """
+                  Parse `dnf/yum check-update` output into plain package names.
+
+                  Handles:
+                    - repo loading / header lines
+                    - "Obsoleting Packages" blocks (not updates; excluded)
+                    - modular stream suffixes like perl:5.32/default
+                    - Security: section markers
+                    - epoch-prefixed NEVRAs (1:curl-7.x.x86_64)
+                    - lines that are clearly not package entries
+                  """
+                  SKIP_PREFIXES = (
+                      "Last metadata",
+                      "Loaded plugins",
+                      "Loading mirror",
+                      "Security:",
+                      "Added Packages",
+                  )
+                  SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Za-z ]+Packages\s*:?$")
+
+                  in_obsoleting = False
+                  pkgs = []
+
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+
+                      # Detect "Obsoleting Packages" block start
+                      if re.match(r"^Obsoleting", line, re.I):
+                          in_obsoleting = True
+                          continue
+
+                      # Any other section header resets obsoleting state
+                      if SECTION_HEADER_RE.match(line):
+                          in_obsoleting = False
+                          continue
+
+                      # Skip lines inside Obsoleting block
+                      if in_obsoleting:
+                          continue
+
+                      # Skip known header / noise prefixes
+                      if any(line.startswith(p) for p in SKIP_PREFIXES):
+                          continue
+
+                      # Skip decoration lines
+                      if re.match(r"^[=\-\*]+$", line):
+                          continue
+
+                      parts = line.split()
+                      if len(parts) < 2:
+                          continue
+
+                      # parts[0] = NEVRA, possibly with modular stream
+                      # e.g.  curl-7.76.1-26.el9_3.2.x86_64
+                      #        perl:5.32/default  (modular, no version col)
+                      #        1:curl-7.76.1-26.el9.x86_64  (epoch-prefixed)
+                      nevra = parts[0]
+                      name  = strip_nevra(nevra)
+
+                      # Sanity: skip if stripping produced an empty string or
+                      # something that looks like a version number
+                      if not name or re.match(r"^\d", name):
+                          continue
+
+                      pkgs.append(name)
+
+                  return sorted(set(pkgs))
+
+
+              def parse_pkg_info(text):
+                  """Parse '<dnf|yum> info ...' output into {name: {field: value}}."""
+                  result = {}
+                  block  = {}
+                  cur_key = None
+                  for line in text.splitlines():
+                      if not line.strip():
+                          if "Name" in block:
+                              result.setdefault(block["Name"], block)
+                          block, cur_key = {}, None
+                          continue
+                      if line[:1] in (" ", "\t") and cur_key:
+                          block[cur_key] = (
+                              block.get(cur_key, "") + " " + line.strip()
+                          ).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          block[key] = val
+                          cur_key = key
+                  if "Name" in block:
+                      result.setdefault(block["Name"], block)
+                  return result
+
+
+              # ── FIX #4: robust updateinfo CVE parser ────────────────────────
+              def parse_updateinfo_cves(text):
+                  """
+                  Parse '<dnf|yum> updateinfo info security' output into
+                  {pkg_name: 'CVE-...,CVE-...'} without any per-package calls.
+
+                  Handles format variations across:
+                    - yum-plugin-security (RHEL 6/7)
+                    - dnf native updateinfo (RHEL 8 / AlmaLinux / Rocky)
+                    - dnf5 (RHEL 9 / newer AlmaLinux)
+
+                  Block separators: "===" lines OR "Name :" / "Update ID :" lines.
+                  CVE fields: "CVE :", "CVEs :", indented continuation lines.
+                  Package block headers: "Updated|Affected|Fixed Packages :" (case-insensitive).
+                  """
+                  cve_map = {}
+                  cves, pkgs, in_pkgs = [], [], False
+
+                  # Compiled patterns for the hot path
+                  BLOCK_SEP_RE   = re.compile(r"^(={3,}|(Name|Update\s*ID)\s*:)", re.I)
+                  CVE_FIELD_RE   = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
+                  CVE_BARE_RE    = re.compile(r"^(CVE-\d{4}-\d+)", re.I)
+                  PKG_HDR_RE     = re.compile(
+                      r"^(Updated|Affected|Fixed)\s+[Pp]ackages\s*:", re.I
+                  )
+                  # Any non-CVE "Key : value" line ends the package block
+                  FIELD_RE       = re.compile(r"^\w[\w\s]+\s*:")
+
+                  def flush():
+                      if cves and pkgs:
+                          for p in pkgs:
+                              n = strip_nevra(p)
+                              if n:
+                                  cve_map.setdefault(n, set()).update(cves)
+
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+
+                      # Block separator — flush current advisory and reset
+                      if BLOCK_SEP_RE.match(line):
+                          flush()
+                          cves, pkgs, in_pkgs = [], [], False
+                          continue
+
+                      # CVE field (may appear multiple times in one advisory)
+                      m = CVE_FIELD_RE.match(line)
+                      if m:
+                          cves += re.findall(r"CVE-\d{4}-\d+", m.group(1))
+                          continue
+
+                      # Bare CVE line (indented continuation in some formats)
+                      if not in_pkgs and CVE_BARE_RE.match(line):
+                          cves += re.findall(r"CVE-\d{4}-\d+", line)
+                          continue
+
+                      # Package-block header
+                      if PKG_HDR_RE.match(line):
+                          in_pkgs = True
+                          continue
+
+                      # Any other key:value field ends the package block
+                      if FIELD_RE.match(line) and not CVE_FIELD_RE.match(line):
+                          in_pkgs = False
+                          continue
+
+                      # Inside package block — collect NEVRA entries
+                      if in_pkgs and line:
+                          pkgs.append(line)
+
+                  flush()
+                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
+
+
+              def categorize_redhat(pkg, in_security_list):
+                  """Returns (category, security_source) tuple (Fix #5)."""
+                  if in_security_list:
+                      return "Security", "updateinfo-list-security"
+                  if RH_KERNEL_RE.match(pkg):
+                      return "Kernel", "none"
+                  if RH_RUNTIME_RE.match(pkg):
+                      return "Runtime", "none"
+                  if pkg.lower().startswith("lib"):
+                      return "Library", "none"
+                  return "Application", "none"
+
+
+              def scan_redhat(distro=""):
+                  """
+                  distro: ansible_distribution value, e.g. "RedHat", "CentOS",
+                  "AlmaLinux", "Rocky", "Amazon", "OracleLinux".
+                  Used for distro-specific branching (Fix #6).
+                  """
+                  mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
+                  if not mgr:
+                      return []
+
+                  # FIX #6 — skip updateinfo CVE parsing on distros with unstable format
+                  skip_updateinfo = distro.lower().replace(" ", "") in RH_SKIP_UPDATEINFO_DISTROS
+
+                  rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
+                  if rc not in (0, 100):
+                      return []
+
+                  # FIX #3 — section-state-aware parser
+                  pkgs = parse_check_update(out)
+                  if not pkgs:
+                      return []
+
+                  _, avail_out, _ = run([mgr, "-q", "info", *pkgs], timeout=180)
+                  avail = parse_pkg_info(avail_out)
+
+                  _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
+                  installed = parse_pkg_info(inst_out)
+
+                  _, seclist_out, _ = run(
+                      [mgr, "-q", "updateinfo", "list", "security", "--available"],
+                      timeout=180,
+                  )
+                  security_pkgs = set()
+                  for raw in seclist_out.splitlines():
+                      parts = raw.split()
+                      if len(parts) >= 3:
+                          security_pkgs.add(strip_nevra(parts[-1]))
+
+                  # FIX #4 — robust updateinfo CVE parser; skip on certain distros
+                  cve_map = {}
+                  if not skip_updateinfo:
+                      _, secinfo_out, _ = run(
+                          [mgr, "-q", "updateinfo", "info", "security", "--available"],
+                          timeout=180,
+                      )
+                      cve_map = parse_updateinfo_cves(secinfo_out)
+
+                  results = []
+                  for pkg in pkgs:
+                      a = avail.get(pkg, {})
+                      i = installed.get(pkg, {})
+
+                      a_ver, a_rel = a.get("Version", ""), a.get("Release", "")
+                      new_ver = f"{a_ver}-{a_rel}" if a_rel else (a_ver or "unknown")
+
+                      i_ver, i_rel = i.get("Version", ""), i.get("Release", "")
+                      cur_ver = f"{i_ver}-{i_rel}" if i_rel else (i_ver or "unknown")
+
+                      # FIX #2 — sanitise size field
+                      raw_size = a.get("Size") or i.get("Size") or "0"
+                      size_kb  = re.sub(r"[^\d]", "", str(raw_size)) or "0"
+
+                      desc = a.get("Summary") or i.get("Summary") or ""
+
+                      # FIX #5 — category + security_source confidence tier
+                      category, security_source = categorize_redhat(
+                          pkg, pkg in security_pkgs
+                      )
+                      cves = cve_map.get(pkg, "")
+
+                      results.append(
+                          {
+                              "name":            pkg,
+                              "current_version": cur_ver,
+                              "new_version":     new_ver,
+                              "size_kb":         size_kb,   # estimated size, not download size
+                              "description":     desc[:120],
+                              "origin":          "RedHat",
+                              "category":        category,
+                              "security_source": security_source,  # FIX #5
+                              "cves":            cves,
+                          }
+                      )
+                  return results
+
+
+              # ═══════════════════════════════════════════════════════════════
+              # Entry point
+              # ═══════════════════════════════════════════════════════════════
+
+              def main():
+                  os_family = sys.argv[1] if len(sys.argv) > 1 else ""
+                  # FIX #6 — receive ansible_distribution for distro-aware branching
+                  distro    = sys.argv[2] if len(sys.argv) > 2 else ""
+
+                  try:
+                      if os_family == "Debian":
+                          patches = scan_debian(distro=distro)
+                      elif os_family == "RedHat":
+                          patches = scan_redhat(distro=distro)
+                      else:
+                          patches = []
+                  except Exception:  # noqa: BLE001 — never crash; always emit valid JSON
+                      patches = []
+
+                  print(json.dumps(patches))
+
+
+              if __name__ == "__main__":
+                  main()
+              {% endraw %}
+
+        - name: Run patch scanner
+          # FIX #6 — pass ansible_distribution as second argument
+          command: >
+            {{ patch_scanner_python }}
+            {{ remote_scanner }}
+            {{ ansible_os_family }}
+            {{ ansible_distribution }}
+          register: scan_result
+          changed_when: false
+          failed_when: false
+          timeout: "{{ patch_scan_timeout }}"
+          environment:
+            LC_ALL: C
+            LANG: C
+            PATCH_DETAIL_LIMIT: "{{ patch_detail_limit }}"
+            PATCH_FETCH_CVES:   "{{ '1' if patch_fetch_cves else '0' }}"
+
+        - name: Parse patch scanner output
+          block:
+            - set_fact:
+                all_patches: "{{ scan_result.stdout | from_json }}"
+          rescue:
+            - set_fact:
+                all_patches: []
+                scan_error: >-
+                  Patch scanner failed (rc={{ scan_result.rc }}):
+                  {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
+                     | trim | truncate(300) }}
+
+      always:
+        - name: Remove patch scanner script
+          file:
+            path:  "{{ remote_scanner }}"
+            state: absent
+          ignore_errors: yes
+
+    - name: Note unsupported OS family
+      set_fact:
+        scan_error: "Unsupported ansible_os_family '{{ ansible_os_family }}' — no patch scan performed"
+      when: ansible_os_family not in ['Debian', 'RedHat']
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Build JSON and send back to controller
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Write report JSON on remote host
+      copy:
+        # Always write even when patch_count == 0 (host is up-to-date).
+        # Schema note: security_source field added per Fix #5.
+        content: |
+          {{ {
+            'hostname':    inventory_hostname,
+            'ip':          (ansible_host | default(inventory_hostname)),
+            'os':          (ansible_distribution ~ ' ' ~ ansible_distribution_version),
+            'kernel':      ansible_kernel,
+            'arch':        ansible_architecture,
+            'scan_time':   ansible_date_time.iso8601,
+            'patch_count': (all_patches | length),
+            'patches':     all_patches,
+            'scan_error':  scan_error
+          } | to_nice_json }}
+        dest: "{{ remote_report }}"
+
+    # dest uses {{ report_dir }} — the per-job path passed by Flask
+    - name: Fetch report to controller (per-job directory)
+      fetch:
+        src:  "{{ remote_report }}"
+        dest: "{{ report_dir }}/{{ inventory_hostname }}.json"
+        flat: yes    # flat=yes → no extra subdirectory
+
+    - name: Remove temp report from remote host
+      file:
+        path:  "{{ remote_report }}"
+        state: absent
+       
