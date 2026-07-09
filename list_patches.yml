@@ -69,9 +69,15 @@
 #
 # Per-host stat schema (available via AWX job stats/artifacts):
 #   patch_report: { hostname, ip, os, kernel, arch, scan_time,
-#                    patch_count, patches[], scan_error }
+#                    patch_count, patches[], scan_error,
+#                    security_count, bugfix_count, enhancement_count, system_count }
 #   each patch: { name, current_version, new_version, size_kb,
-#                 description, origin, category, security_source, cves }
+#                 description, origin, category, display_category,
+#                 security_source, cves }
+#   display_category is one of SECURITY / BUGFIX / ENHANCEMENT / SYSTEM —
+#   the coarse bucket used for AWX color-coding. RHEL family uses real
+#   dnf/yum advisory-type data for BUGFIX/ENHANCEMENT; Debian/Ubuntu has no
+#   equivalent metadata, so its non-security updates fall under SYSTEM.
 
 - name: List Available Patches (AWX)
   hosts: "{{ target_hosts | default('all') }}"
@@ -86,19 +92,58 @@
     patch_scan_timeout:   900    # seconds; generous cap for metadata refresh + scan
     patch_scanner_python: "/usr/bin/python3"
 
+    # ANSI color codes for AWX Job Output (AWX's terminal-style output view
+    # renders these directly). \e is YAML's own escape for ESC (0x1B) inside
+    # double-quoted scalars — this is not something Jinja needs to interpret.
+    color_reset:  "\e[0m"
+    color_bold:   "\e[1m"
+    color_red:    "\e[1;31m"    # Security
+    color_yellow: "\e[1;33m"    # Bugfix
+    color_blue:   "\e[1;34m"    # Enhancement
+    color_green:  "\e[1;32m"    # System / regular updates
+    color_cyan:   "\e[1;36m"    # package names
+
   tasks:
 
     # ───────────────────────────────────────────────────────────────────────
     # Always refresh package metadata so the scan is accurate
     # (metadata sync only — this does NOT install or upgrade anything)
     # ───────────────────────────────────────────────────────────────────────
+    # NOTE: uses a raw `apt-get update` (not the `apt:` module's
+    # update_cache: yes) on purpose. The apt module treats ANY repo
+    # failing to refresh as a hard task failure — so a single stale/
+    # unreachable local repo entry in sources.list would previously
+    # abort the whole scan even though every real internet repo synced
+    # fine. failed_when: false lets it keep going and scan against
+    # whatever repos (i.e. the internet ones) actually responded.
     - name: "[Debian] Refresh apt cache — always, so the scan is accurate"
-      apt:
-        update_cache: yes
-        cache_valid_time: 0      # MUST be 0; any other value returns stale lists
-        update_cache_retries: 3
-        update_cache_retry_max_delay: 5
+      shell: |
+        set -o pipefail
+        apt-get update -o Acquire::Retries=3
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+        LANG: C
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: apt_update_result
       when: ansible_os_family == "Debian"
+
+    - name: "[Debian] Warn (non-fatal) if any repo failed to refresh"
+      debug:
+        msg: >-
+          apt-get update reported errors on {{ inventory_hostname }} — likely
+          one or more unreachable/local repo entries in sources.list. Scan
+          will continue using whatever repos (internet ones) did refresh.
+          Details: {{ (apt_update_result.stderr | default('') + ' ' + apt_update_result.stdout | default(''))
+                       | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined
+        - apt_update_result.rc != 0
+
 
     - name: "[RedHat] Refresh package metadata — always, so the scan is accurate"
       shell: |
@@ -115,6 +160,19 @@
       timeout: "{{ patch_scan_timeout }}"
       register: rh_makecache
       when: ansible_os_family == "RedHat"
+
+    - name: "[RedHat] Warn (non-fatal) if metadata refresh failed"
+      debug:
+        msg: >-
+          makecache reported errors on {{ inventory_hostname }} — likely
+          one or more unreachable/local repo entries in *.repo files. Scan
+          will continue using whatever repos (internet ones) did refresh.
+          Details: {{ (rh_makecache.stderr | default('') + ' ' + rh_makecache.stdout | default(''))
+                       | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined
+        - rh_makecache.rc != 0
 
     # ───────────────────────────────────────────────────────────────────────
     # Initialize results (covers OS families we don't actively scan)
@@ -392,6 +450,12 @@
                               "description":     desc[:120],
                               "origin":          origin,
                               "category":        category,
+                              # display_category: coarse bucket used by the
+                              # playbook for AWX color-coding. Debian/apt has
+                              # no native bugfix-vs-enhancement metadata like
+                              # dnf's advisory types, so anything non-security
+                              # is bucketed as SYSTEM rather than guessed.
+                              "display_category": "SECURITY" if category == "Security" else "SYSTEM",
                               "security_source": security_source,
                               "cves":            cves,
                           }
@@ -588,6 +652,45 @@
                   return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
 
 
+              def parse_updateinfo_list_types(text):
+                  """
+                  Parse `<dnf|yum> updateinfo list --available` (ALL advisories,
+                  not just security) into {pkg_name: 'security'|'bugfix'|'enhancement'}.
+
+                  This gives Bugfix/Enhancement a REAL classification straight
+                  from dnf/yum's own advisory data, instead of guessing.
+                  Typical line shape (dnf4/dnf5/yum-plugin-security all vary a
+                  little, but always end with the NEVRA and have a type token
+                  somewhere in the middle, e.g.):
+                      FEDORA-2024-abcd   Security/Important   pkg-1.2-3.fc40.x86_64
+                      RHSA-2024:1234     Bugfix                pkg-1.2-3.el9.x86_64
+                  If a package shows up under more than one advisory type,
+                  'security' always wins (matches categorize_redhat's priority).
+                  """
+                  result = {}
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line or line.startswith(("Last metadata", "Loaded plugins")):
+                          continue
+                      parts = line.split()
+                      if len(parts) < 3:
+                          continue
+                      type_field = parts[1].lower()
+                      pkg_field  = parts[-1]
+                      if "sec" in type_field:
+                          kind = "security"
+                      elif "bug" in type_field:
+                          kind = "bugfix"
+                      elif "enh" in type_field:
+                          kind = "enhancement"
+                      else:
+                          continue
+                      name = strip_nevra(pkg_field)
+                      if name and result.get(name) != "security":
+                          result[name] = kind
+                  return result
+
+
               def categorize_redhat(pkg, in_security_list):
                   """Returns (category, security_source) tuple."""
                   if in_security_list:
@@ -647,6 +750,18 @@
                       )
                       cve_map = parse_updateinfo_cves(secinfo_out)
 
+                  # Bugfix/Enhancement classification (real advisory data, not
+                  # a guess). Skipped on the same distros that skip security
+                  # updateinfo parsing, since their updateinfo format isn't
+                  # stable enough to trust here either.
+                  update_types = {}
+                  if not skip_updateinfo:
+                      _, alltypes_out, _ = run(
+                          [mgr, "-q", "updateinfo", "list", "--available"],
+                          timeout=180,
+                      )
+                      update_types = parse_updateinfo_list_types(alltypes_out)
+
                   def _fmt_version(info):
                       """
                       Build a full NEVR-style version string, including Epoch
@@ -677,6 +792,21 @@
                       )
                       cves = cve_map.get(pkg, "")
 
+                      # display_category: coarse bucket used by the playbook
+                      # for AWX color-coding. Uses REAL dnf/yum advisory type
+                      # data where available; anything with no matching
+                      # advisory (a plain package bump with no bugzilla/CVE
+                      # tied to it) falls back to SYSTEM.
+                      utype = update_types.get(pkg)
+                      if pkg in security_pkgs or utype == "security":
+                          display_category = "SECURITY"
+                      elif utype == "bugfix":
+                          display_category = "BUGFIX"
+                      elif utype == "enhancement":
+                          display_category = "ENHANCEMENT"
+                      else:
+                          display_category = "SYSTEM"
+
                       results.append(
                           {
                               "name":            pkg,
@@ -686,6 +816,7 @@
                               "description":     desc[:120],
                               "origin":          "RedHat",
                               "category":        category,
+                              "display_category": display_category,
                               "security_source": security_source,
                               "cves":            cves,
                           }
@@ -759,21 +890,62 @@
       when: ansible_os_family not in ['Debian', 'RedHat']
 
     # ───────────────────────────────────────────────────────────────────────
-    # DISPLAY — shows the patch list directly in the AWX Job Output tab.
+    # DISPLAY — shows the patch list directly in the AWX Job Output tab,
+    # colorized with ANSI codes (AWX's job output view renders these).
     # Read-only; changes nothing.
+    #
+    #   SECURITY    -> red     (real CVE/security advisories)
+    #   BUGFIX      -> yellow  (RHEL: real dnf/yum bugfix advisories only)
+    #   ENHANCEMENT -> blue    (RHEL: real dnf/yum enhancement advisories only)
+    #   SYSTEM      -> green   (everything else — incl. all non-security
+    #                           Debian/Ubuntu updates, since apt has no
+    #                           native bugfix/enhancement metadata to draw on)
     # ───────────────────────────────────────────────────────────────────────
-    - name: "Summary: patches available on {{ inventory_hostname }}"
-      debug:
-        msg: >-
-          {{ all_patches | length }} patch(es) available on {{ inventory_hostname }}
-          ({{ ansible_distribution }} {{ ansible_distribution_version }}).
-          {{ 'SCAN ERROR: ' ~ scan_error if scan_error else 'No pending patches.' if (all_patches | length) == 0 else '' }}
+    - name: Compute patch counts by category
+      set_fact:
+        security_count:    "{{ all_patches | selectattr('display_category', 'equalto', 'SECURITY')    | list | length }}"
+        bugfix_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'BUGFIX')      | list | length }}"
+        enhancement_count: "{{ all_patches | selectattr('display_category', 'equalto', 'ENHANCEMENT') | list | length }}"
+        system_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'SYSTEM')      | list | length }}"
+      when: (all_patches | length) > 0
 
-    - name: "Patch detail: {{ inventory_hostname }}"
+    - name: "Colorized patch summary: {{ inventory_hostname }}"
+      debug:
+        msg: |
+          {{ color_bold }}============== PATCH SUMMARY: {{ inventory_hostname }} =================={{ color_reset }}
+          {{ color_red }}Security Updates   : {{ security_count }}{{ color_reset }}
+          {{ color_yellow }}Bugfix Updates     : {{ bugfix_count }}{{ color_reset }}
+          {{ color_blue }}Enhancements       : {{ enhancement_count }}{{ color_reset }}
+          {{ color_green }}System Updates     : {{ system_count }}{{ color_reset }}
+          {{ color_bold }}================================================================{{ color_reset }}
+      when: (all_patches | length) > 0
+
+    - name: "Status: {{ inventory_hostname }}"
       debug:
         msg: >-
-          {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
-          [{{ item.category }}]{{ (' CVEs: ' ~ item.cves) if item.cves else '' }}
+          {{ (color_red ~ 'SCAN ERROR: ' ~ scan_error ~ color_reset)
+             if scan_error
+             else (color_green ~ 'No pending patches on ' ~ inventory_hostname ~ color_reset) }}
+      when: (all_patches | length) == 0
+
+    - name: "Patch detail (colorized): {{ inventory_hostname }}"
+      debug:
+        msg: |
+          {%- set cve_list = item.cves.split(',') if item.cves else [] -%}
+          {%- if item.display_category == 'SECURITY' -%}{%- set c = color_red -%}
+          {%- elif item.display_category == 'BUGFIX' -%}{%- set c = color_yellow -%}
+          {%- elif item.display_category == 'ENHANCEMENT' -%}{%- set c = color_blue -%}
+          {%- else -%}{%- set c = color_green -%}
+          {%- endif -%}
+          {{ color_bold }}===================================================={{ color_reset }}
+          {{ c }}[{{ item.display_category }}]{{ color_reset }} {{ color_cyan }}{{ item.name }}{{ color_reset }}
+          Current: {{ item.current_version }}
+          New    : {{ item.new_version }}
+          {%- if cve_list | length > 3 %}
+          CVEs   : {{ cve_list[:3] | join(', ') }}, ... (+{{ cve_list | length - 3 }} more)
+          {%- elif cve_list %}
+          CVEs   : {{ cve_list | join(', ') }}
+          {%- endif %}
       loop: "{{ all_patches }}"
       loop_control:
         label: "{{ item.name }}"
@@ -798,5 +970,9 @@
             arch:          "{{ ansible_architecture }}"
             scan_time:     "{{ ansible_date_time.iso8601 }}"
             patch_count:   "{{ all_patches | length }}"
+            security_count:    "{{ security_count | default(0) }}"
+            bugfix_count:      "{{ bugfix_count | default(0) }}"
+            enhancement_count: "{{ enhancement_count | default(0) }}"
+            system_count:      "{{ system_count | default(0) }}"
             patches:       "{{ all_patches }}"
             scan_error:    "{{ scan_error }}"
