@@ -607,13 +607,21 @@
     - name: "System patch summary: {{ inventory_hostname }}"
       debug:
         msg:
-          - "============ SYSTEM-ONLY PATCH: {{ inventory_hostname }} ============"
+          - "============ SYSTEM-ONLY PATCH: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}) ============"
           - "Mode            : {{ 'DRY RUN (nothing changed)' if (dry_run | bool) else 'APPLIED' }}"
-          - "System patched  : {{ (system_patch_details | map(attribute='name') | list | join(', ')) if system_patch_details else '(none)' }}"
+          - "Total system patches: {{ system_patch_details | length }}"
           - "Advisory-backed updates left untouched: {{ (all_patches | length) - (system_packages | length) }}"
           - "Reboot required : {{ reboot_required }}"
           - "Install error   : {{ install_error if install_error else '(none)' }}"
           - "======================================================================"
+
+    - name: "System patches — {{ inventory_hostname }} ({{ system_patch_details | length }} total)"
+      debug:
+        msg: "{{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}"
+      loop: "{{ system_patch_details }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (system_patch_details | length) > 0
 
     - name: Store system patch report as a plain host fact (for aggregation)
       set_fact:
