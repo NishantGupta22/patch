@@ -1,0 +1,847 @@
+---
+# apply_security_patches_awx.yml
+#
+# Self-contained AWX job: scans a host, identifies exactly which pending
+# updates are SECURITY updates (same classification logic as
+# list_patches_awx.yml — Debian -security pocket / dnf-yum security
+# advisories), and installs ONLY those. Every non-security update
+# (BUGFIX, ENHANCEMENT, SYSTEM, plain version bumps) is left untouched.
+#
+# No survey fields required beyond the two below — this is meant to be
+# schedulable as-is (e.g. "run every night, patch security only").
+#
+#   target_hosts        which inventory group/host to run against
+#   dry_run              true (default) = preview only, check mode
+#   reboot_if_required    false (default) = don't auto-reboot on kernel patch
+#
+# Why this re-scans instead of reusing a previous job's output: security
+# classification depends on live repo state (Debian's -security pocket
+# membership, RHEL's updateinfo advisories) at the moment of the scan, so
+# reusing a stale list could patch something that's no longer classified
+# as security, or miss one that newly became security. This always
+# checks the current, authoritative state before deciding what to touch.
+#
+# INSTALL ENFORCEMENT (not just classification):
+#   RHEL family — the actual install uses dnf/yum's own `security: true,
+#     update_only: true, name: '*'` filter, so DNF/YUM itself decides
+#     which installed packages have a pending security advisory at
+#     install time, rather than us handing it our own pre-computed name
+#     list. This is the officially supported RHEL/Alma/Rocky method.
+#   Debian/Ubuntu — the apt install is pinned with `default_release:
+#     "<release>-security"`, so APT itself resolves candidates from the
+#     security suite rather than us just trusting our own classification.
+#     Kali has no separate -security suite, so it falls back to our
+#     scanner's classification only.
+# In both cases the scanner's security_packages list still drives the
+# human-readable report and the dry-run preview.
+#
+# CVE REPORTING: the scanner attaches a comma-separated `cves` field to
+# each SECURITY package where the vendor advisory names one (Debian via
+# `apt-get changelog`, RHEL via `dnf/yum updateinfo info security`). Not
+# every SECURITY package will have a CVE listed — some advisories don't
+# reference a CVE at all, and the changelog/updateinfo parse can come up
+# empty (e.g. FETCH_CVES disabled, Amazon/Oracle's updateinfo skip). CVEs
+# are reporting-only: they never influence whether a package gets
+# patched — that decision is entirely the vendor's SECURITY
+# classification (see INSTALL ENFORCEMENT above). A consolidated,
+# deduplicated CVE list across all patched packages on the host is built
+# below (security_patch_cves) and surfaced in the summary, the per-package
+# loop, and the per-host/aggregated job-stats report.
+#
+# RHEL CVE PARSING NOTE: dnf5's `updateinfo info` TEXT output is not the
+# same layout as classic dnf/yum's — it has no bare "CVEs:" line at all,
+# CVE references live in a References block instead. So on dnf5 hosts
+# (e.g. AlmaLinux/Rocky 9.4+, Fedora, newer RHEL clones) we call dnf5's
+# own `--json` output for updateinfo info and parse that structured
+# References array, instead of regexing text that was never in the
+# format the parser expected. Classic dnf/yum (RHEL7/8, Amazon, Oracle
+# where applicable) keep the original text-based CVEs: parser, which
+# matches their actual output.
+#
+# REBOOT DETECTION: uses the authoritative OS-native check rather than
+# guessing from package names — /var/run/reboot-required on Debian/Ubuntu
+# (written by the OS itself when a reboot is actually needed), and
+# `needs-restarting -r` on RHEL family (from dnf-utils/yum-utils). A
+# kernel-name match alone would miss other reboot-triggering packages
+# (glibc, systemd, etc.) and can't tell you the OS's own opinion.
+#
+# FAILURE HANDLING: the install step is wrapped in block/rescue so a
+# single package's dependency conflict or install failure is captured
+# and reported cleanly instead of aborting the whole host's run mid-way
+# and silently skipping the report/stats-publish steps for it.
+#
+# MAINTENANCE WINDOWS: `patch_serial` controls how many hosts are patched
+# concurrently (Ansible's `serial`). Defaults to '100%' (no batching, same
+# as before) — override via survey/extra_vars (e.g. 10, or '20%') when
+# rolling out across a large fleet to limit blast radius.
+#
+# Compatibility: Ubuntu/Debian/Kali (apt) and RHEL family (dnf/yum/dnf5),
+# matching list_patches_awx.yml and apply_patches_awx.yml.
+
+- name: Apply Security Patches Only (AWX)
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: yes
+  become: yes
+  serial: "{{ patch_serial | default('100%') }}"
+  vars:
+    remote_scanner: "/tmp/.sec_patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
+    dry_run: true
+    reboot_if_required: false
+    reboot_timeout: 600
+    patch_detail_limit: 500
+    patch_fetch_cves: true
+    patch_scan_timeout: 900
+    patch_scanner_python: "/usr/bin/python3"
+
+  tasks:
+
+    # ───────────────────────────────────────────────────────────────────
+    # Refresh package metadata so security classification is accurate
+    # (metadata sync only — never installs/upgrades anything)
+    # ───────────────────────────────────────────────────────────────────
+    - name: "[Debian] Refresh apt cache"
+      shell: |
+        set -o pipefail
+        apt-get update -o Acquire::Retries=3
+      args:
+        executable: /bin/bash
+      environment: { LC_ALL: C, LANG: C }
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: apt_update_result
+      when: ansible_os_family == "Debian"
+
+    - name: "[Debian] Warn (non-fatal) if any repo failed to refresh"
+      debug:
+        msg: >-
+          apt-get update reported errors on {{ inventory_hostname }} — scan
+          will continue using whatever repos did refresh.
+          {{ (apt_update_result.stderr | default('') + ' ' + apt_update_result.stdout | default(''))
+             | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined
+        - apt_update_result.rc != 0
+
+    - name: "[RedHat] Refresh package metadata"
+      shell: |
+        set -e
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q makecache
+      args:
+        executable: /bin/bash
+      environment: { LC_ALL: C, LANG: C }
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: rh_makecache
+      when: ansible_os_family == "RedHat"
+
+    - name: "[RedHat] Warn (non-fatal) if metadata refresh failed"
+      debug:
+        msg: >-
+          makecache reported errors on {{ inventory_hostname }} — scan will
+          continue using whatever repos did refresh.
+          {{ (rh_makecache.stderr | default('') + ' ' + rh_makecache.stdout | default(''))
+             | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined
+        - rh_makecache.rc != 0
+
+    - name: Initialize scan results
+      set_fact:
+        all_patches: []
+        scan_error: ""
+        security_packages: []
+        install_error: ""
+
+    # ───────────────────────────────────────────────────────────────────
+    # Scan — identical classification logic to list_patches_awx.yml, so
+    # "security" here always matches what your list job would show as
+    # [SECURITY]. Never installs or modifies anything by itself.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Scan and apply security-only patches
+      when: ansible_os_family in ['Debian', 'RedHat']
+      block:
+
+        - name: Copy patch scanner script to remote host
+          copy:
+            dest: "{{ remote_scanner }}"
+            mode: "0700"
+            content: |
+              {% raw %}
+              #!/usr/bin/env python3
+              """
+              patch_scanner.py — used by apply_security_patches_awx.yml to
+              identify which pending updates are SECURITY. Same
+              classification logic as list_patches_awx.yml. Never installs
+              or modifies packages; always exits 0 and prints valid JSON.
+              """
+
+              import json, os, re, shutil, subprocess, sys
+
+              DETAIL_LIMIT = int(os.environ.get("PATCH_DETAIL_LIMIT", "500"))
+              FETCH_CVES   = os.environ.get("PATCH_FETCH_CVES", "1").lower() not in ("0", "false", "no")
+
+              ARCH_SUFFIX_RE = re.compile(
+                  r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
+              )
+              VER_REL_RE = re.compile(r"-[^-:]+-[^-:]+$")
+
+              def run(cmd, timeout=180):
+                  try:
+                      proc = subprocess.run(cmd, capture_output=True, text=True,
+                                             timeout=timeout, errors="replace")
+                      return proc.returncode, proc.stdout, proc.stderr
+                  except FileNotFoundError:
+                      return 127, "", "command not found"
+                  except subprocess.TimeoutExpired:
+                      return 124, "", "timed out"
+                  except Exception as exc:
+                      return 1, "", str(exc)
+
+              # ── Debian / Ubuntu / Kali ──────────────────────────────
+              # Strict/authoritative classification: a package counts as
+              # SECURITY only if its candidate version is confirmed to
+              # come from the distro's -security pocket (via apt-cache
+              # madison). No name-based or section-based guessing — since
+              # install is pinned to default_release=-security, a package
+              # like openssl can have a completely ordinary non-security
+              # update, and guessing by name would only produce false
+              # positives against what APT will actually install.
+              #
+              # Consequence: Kali has no separate -security suite, so
+              # is_security_pocket is always False there (see is_kali
+              # check below) — this scanner will correctly report zero
+              # SECURITY packages on Kali rather than guess. That's
+              # accurate, not a bug: there's no authoritative source to
+              # confirm "security" against on Kali.
+
+              def get_apt_policy(pkgs):
+                  rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
+                  result, cur_pkg = {}, None
+                  for line in out.splitlines():
+                      m = re.match(r"^(\S+):$", line)
+                      if m:
+                          cur_pkg = m.group(1)
+                          result[cur_pkg] = {"installed": "unknown", "candidate": "unknown"}
+                          continue
+                      if cur_pkg:
+                          mi = re.match(r"\s+Installed:\s+(\S+)", line)
+                          mc = re.match(r"\s+Candidate:\s+(\S+)", line)
+                          if mi:
+                              v = mi.group(1)
+                              result[cur_pkg]["installed"] = "" if v == "(none)" else v
+                          if mc:
+                              v = mc.group(1)
+                              result[cur_pkg]["candidate"] = "" if v == "(none)" else v
+                  return result
+
+              def debian_is_security(is_security_pocket):
+                  return bool(is_security_pocket)
+
+
+
+              def debian_cves(pkg, timeout=6):
+                  rc, out, _ = run(["apt-get", "changelog", pkg], timeout=timeout)
+                  if rc != 0:
+                      return ""
+                  return ",".join(sorted(set(re.findall(r"CVE-\d{4}-\d+", out))))
+
+              def scan_debian(distro=""):
+                  is_kali = distro.lower() == "kali"
+                  rc, out, _ = run(
+                      ["apt-get", "-s", "dist-upgrade", "-o", "Debug::NoLocking=true"],
+                      timeout=300,
+                  )
+                  pkgs = sorted({l.split()[1] for l in out.splitlines()
+                                 if l.startswith("Inst ") and len(l.split()) > 1})
+                  if not pkgs:
+                      return []
+
+                  policy = get_apt_policy(pkgs)
+
+                  madison = {}
+                  if not is_kali:
+                      _, madison_out, _ = run(["apt-cache", "madison", *pkgs], timeout=60)
+                      for line in madison_out.splitlines():
+                          cols = [c.strip() for c in line.split("|")]
+                          if len(cols) >= 3:
+                              madison.setdefault(cols[0], []).append((cols[1], cols[2]))
+
+                  results, cve_lookups = [], 0
+                  for pkg in pkgs:
+                      pol = policy.get(pkg, {})
+                      cur_ver = pol.get("installed", "unknown") or "unknown"
+                      new_ver = pol.get("candidate", "unknown") or "unknown"
+
+                      is_security_pocket = (not is_kali) and any(
+                          "-security" in src and (new_ver in ("unknown", "") or ver == new_ver)
+                          for ver, src in madison.get(pkg, [])
+                      )
+                      is_sec = debian_is_security(is_security_pocket)
+
+                      cves = ""
+                      if is_sec and FETCH_CVES and cve_lookups < DETAIL_LIMIT:
+                          cve_lookups += 1
+                          cves = debian_cves(pkg)
+
+                      results.append({
+                          "name": pkg, "current_version": cur_ver, "new_version": new_ver,
+                          "is_security": is_sec, "cves": cves,
+                      })
+                  return results
+
+              # ── RHEL / CentOS / AlmaLinux / Rocky / Amazon / Oracle ──
+              def strip_nevra(nevra):
+                  name = ARCH_SUFFIX_RE.sub("", nevra)
+                  name = VER_REL_RE.sub("", name)
+                  name = re.sub(r"^\d+:", "", name)
+                  return name.split(":")[0]
+
+              def parse_check_update(text):
+                  SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Loading mirror", "Security:", "Added Packages")
+                  SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Za-z ]+Packages\s*:?$")
+                  in_obsoleting, pkgs = False, []
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+                      if re.match(r"^Obsoleting", line, re.I):
+                          in_obsoleting = True
+                          continue
+                      if SECTION_HEADER_RE.match(line):
+                          in_obsoleting = False
+                          continue
+                      if in_obsoleting or any(line.startswith(p) for p in SKIP_PREFIXES):
+                          continue
+                      if re.match(r"^[=\-\*]+$", line):
+                          continue
+                      parts = line.split()
+                      if len(parts) < 2:
+                          continue
+                      name = strip_nevra(parts[0])
+                      if not name or re.match(r"^\d", name):
+                          continue
+                      pkgs.append(name)
+                  return sorted(set(pkgs))
+
+              def parse_pkg_info(text, only_section=None):
+                  result, block, cur_key, cur_section = {}, {}, None, None
+                  def header_kind(line):
+                      h = line.strip().lower().rstrip(":").strip()
+                      if h == "installed packages": return "installed"
+                      if h == "available packages": return "available"
+                      return None
+                  for line in text.splitlines():
+                      kind = header_kind(line)
+                      if kind:
+                          cur_section = kind
+                          continue
+                      if not line.strip():
+                          if "Name" in block and (only_section is None or cur_section == only_section):
+                              result.setdefault(block["Name"], block)
+                          block, cur_key = {}, None
+                          continue
+                      if line[:1] in (" ", "\t") and cur_key:
+                          block[cur_key] = (block.get(cur_key, "") + " " + line.strip()).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          block[key] = val
+                          cur_key = key
+                  if "Name" in block and (only_section is None or cur_section == only_section):
+                      result.setdefault(block["Name"], block)
+                  return result
+
+              def parse_updateinfo_cves(text):
+                  cve_map, cves, pkgs, in_pkgs = {}, [], [], False
+                  BLOCK_SEP_RE = re.compile(r"^(={3,}|(Name|Update\s*ID)\s*:)", re.I)
+                  CVE_FIELD_RE = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
+                  CVE_BARE_RE  = re.compile(r"^(CVE-\d{4}-\d+)", re.I)
+                  PKG_HDR_RE   = re.compile(r"^(Updated|Affected|Fixed)\s+[Pp]ackages\s*:", re.I)
+                  FIELD_RE     = re.compile(r"^\w[\w\s]+\s*:")
+                  def flush():
+                      if cves and pkgs:
+                          for p in pkgs:
+                              n = strip_nevra(p)
+                              if n:
+                                  cve_map.setdefault(n, set()).update(cves)
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+                      if BLOCK_SEP_RE.match(line):
+                          flush(); cves, pkgs, in_pkgs = [], [], False
+                          continue
+                      m = CVE_FIELD_RE.match(line)
+                      if m:
+                          cves += re.findall(r"CVE-\d{4}-\d+", m.group(1)); continue
+                      if not in_pkgs and CVE_BARE_RE.match(line):
+                          cves += re.findall(r"CVE-\d{4}-\d+", line); continue
+                      if PKG_HDR_RE.match(line):
+                          in_pkgs = True; continue
+                      if FIELD_RE.match(line) and not CVE_FIELD_RE.match(line):
+                          in_pkgs = False; continue
+                      if in_pkgs and line:
+                          pkgs.append(line)
+                  flush()
+                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
+
+              def parse_dnf5_updateinfo_json(raw_json):
+                  """
+                  dnf5's `updateinfo info` TEXT output is a different
+                  layout than classic dnf/yum — it has no bare "CVEs:"
+                  line; CVE references live in a References block
+                  instead (Title/Id/Type/Url per reference). The
+                  classic-format regex parser above can never match that
+                  layout, which is why CVEs silently came back empty on
+                  dnf5 hosts (AlmaLinux/Rocky 9.4+, Fedora, newer RHEL
+                  clones) even though security classification itself was
+                  correct. dnf5 ships a first-class --json mode for this
+                  exact data, so we parse that instead of guessing at its
+                  text format.
+
+                  Expected shape (dnf5 `advisory info --json`): a JSON
+                  array of advisory objects, each with a `references`
+                  array of {Id, Type, ...} and a `collections.packages`
+                  array of affected NEVRAs.
+                  """
+                  cve_map = {}
+                  try:
+                      advisories = json.loads(raw_json)
+                  except (ValueError, TypeError):
+                      return cve_map
+                  if not isinstance(advisories, list):
+                      return cve_map
+                  for adv in advisories:
+                      if not isinstance(adv, dict):
+                          continue
+                      refs = adv.get("references") or []
+                      cves = sorted({
+                          r.get("Id") for r in refs
+                          if isinstance(r, dict)
+                          and str(r.get("Type", "")).lower() == "cve"
+                          and r.get("Id")
+                      })
+                      if not cves:
+                          continue
+                      pkgs = ((adv.get("collections") or {}).get("packages")) or []
+                      for nevra in pkgs:
+                          name = strip_nevra(nevra)
+                          if name:
+                              cve_map.setdefault(name, set()).update(cves)
+                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
+
+              RH_SKIP_UPDATEINFO_DISTROS = {"amazon", "amazonlinux", "oraclelinux", "oracle"}
+
+              def scan_redhat(distro=""):
+                  mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
+                  if not mgr:
+                      return []
+                  is_dnf5 = os.path.basename(mgr) == "dnf5"
+                  skip_updateinfo = distro.lower().replace(" ", "") in RH_SKIP_UPDATEINFO_DISTROS
+
+                  rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
+                  if rc not in (0, 100):
+                      return []
+                  pkgs = parse_check_update(out)
+                  if not pkgs:
+                      return []
+
+                  _, avail_out, _ = run([mgr, "-q", "info", *pkgs], timeout=180)
+                  avail = parse_pkg_info(avail_out, only_section="available")
+                  _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
+                  installed = parse_pkg_info(inst_out, only_section="installed")
+
+                  _, seclist_out, _ = run([mgr, "-q", "updateinfo", "list", "security", "--available"], timeout=180)
+                  security_pkgs = set()
+                  for raw in seclist_out.splitlines():
+                      parts = raw.split()
+                      if len(parts) >= 3:
+                          security_pkgs.add(strip_nevra(parts[-1]))
+
+                  # CVE lookup: dnf5's `updateinfo info` text layout uses a
+                  # References block instead of classic dnf/yum's "CVEs:"
+                  # line, so it gets its own JSON-based path (dnf5 ships a
+                  # first-class --json mode for exactly this data). Classic
+                  # dnf/yum keep the original text parser, which matches
+                  # their actual field format.
+                  cve_map = {}
+                  if not skip_updateinfo:
+                      if is_dnf5:
+                          rc_ci, secinfo_json, _ = run(
+                              [mgr, "-q", "updateinfo", "info", "security", "--available", "--json"],
+                              timeout=180,
+                          )
+                          if rc_ci == 0 and secinfo_json.strip():
+                              cve_map = parse_dnf5_updateinfo_json(secinfo_json)
+                      else:
+                          _, secinfo_out, _ = run([mgr, "-q", "updateinfo", "info", "security", "--available"], timeout=180)
+                          cve_map = parse_updateinfo_cves(secinfo_out)
+
+                  def _fmt_version(info):
+                      ver, rel = info.get("Version", ""), info.get("Release", "")
+                      epoch = info.get("Epoch", "0")
+                      base = f"{ver}-{rel}" if rel else (ver or "unknown")
+                      if base == "unknown":
+                          return base
+                      return f"{epoch}:{base}" if epoch not in ("", "0") else base
+
+                  results = []
+                  for pkg in pkgs:
+                      a, i = avail.get(pkg, {}), installed.get(pkg, {})
+                      results.append({
+                          "name": pkg,
+                          "current_version": _fmt_version(i),
+                          "new_version": _fmt_version(a),
+                          "is_security": pkg in security_pkgs,
+                          "cves": cve_map.get(pkg, ""),
+                      })
+                  return results
+
+              def main():
+                  os_family = sys.argv[1] if len(sys.argv) > 1 else ""
+                  distro    = sys.argv[2] if len(sys.argv) > 2 else ""
+                  try:
+                      if os_family == "Debian":
+                          patches = scan_debian(distro=distro)
+                      elif os_family == "RedHat":
+                          patches = scan_redhat(distro=distro)
+                      else:
+                          patches = []
+                  except Exception:
+                      patches = []
+                  print(json.dumps(patches))
+
+              if __name__ == "__main__":
+                  main()
+              {% endraw %}
+
+        - name: Run patch scanner
+          command: >
+            {{ patch_scanner_python }}
+            {{ remote_scanner }}
+            {{ ansible_os_family }}
+            {{ ansible_distribution }}
+          register: scan_result
+          changed_when: false
+          failed_when: false
+          timeout: "{{ patch_scan_timeout }}"
+          environment:
+            LC_ALL: C
+            LANG: C
+            PATCH_DETAIL_LIMIT: "{{ patch_detail_limit }}"
+            PATCH_FETCH_CVES:   "{{ '1' if patch_fetch_cves else '0' }}"
+
+        - name: Parse patch scanner output
+          block:
+            - set_fact:
+                all_patches: "{{ scan_result.stdout | from_json }}"
+          rescue:
+            - set_fact:
+                all_patches: []
+                scan_error: >-
+                  Patch scanner failed (rc={{ scan_result.rc }}):
+                  {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
+                     | trim | truncate(300) }}
+
+        - name: Build security-only package list
+          set_fact:
+            security_packages: "{{ all_patches | selectattr('is_security', 'equalto', true) | map(attribute='name') | list }}"
+
+        - name: Report — nothing security-related to patch on this host
+          debug:
+            msg: >-
+              {{ scan_error if scan_error else
+                 (all_patches | length) ~ ' pending update(s) on ' ~ inventory_hostname ~
+                 ', none classified as SECURITY. Nothing to do (non-security updates left untouched).' }}
+          when: (security_packages | length) == 0
+
+        # ─────────────────────────────────────────────────────────────
+        # Apply — ONLY the security-classified packages. Everything else
+        # detected in the scan (bugfix/enhancement/plain updates) is
+        # deliberately never named here, so it's never touched.
+        #
+        # Wrapped in block/rescue: a dependency conflict or install
+        # failure on one package is captured here instead of aborting
+        # this host's play run mid-way, which would otherwise skip the
+        # report/stats-publish steps below for it entirely.
+        # ─────────────────────────────────────────────────────────────
+        - name: Apply security patches (failure-contained)
+          block:
+            # default_release pins APT's candidate resolution to the
+            # -security suite for this install, so APT itself enforces
+            # the restriction rather than us just trusting our own
+            # classification. Kali has no separate -security suite, so
+            # this is skipped there (Kali install still relies on
+            # scanner classification, same as before).
+            - name: "[Debian] Install security updates only (APT pinned to -security suite)"
+              apt:
+                name: "{{ security_packages }}"
+                state: latest
+                update_cache: no
+                install_recommends: no
+                default_release: "{{ ansible_distribution_release }}-security"
+              register: apply_result_deb
+              check_mode: "{{ dry_run | bool }}"
+              when:
+                - ansible_os_family == "Debian"
+                - ansible_distribution != "Kali"
+                - (security_packages | length) > 0
+
+            - name: "[Kali] Install security updates only (no -security suite to pin to)"
+              apt:
+                name: "{{ security_packages }}"
+                state: latest
+                update_cache: no
+                install_recommends: no
+              register: apply_result_deb_kali
+              check_mode: "{{ dry_run | bool }}"
+              when:
+                - ansible_distribution == "Kali"
+                - (security_packages | length) > 0
+
+            - set_fact:
+                apply_result_deb: "{{ apply_result_deb_kali }}"
+              when:
+                - ansible_distribution == "Kali"
+                - (security_packages | length) > 0
+
+            # RHEL7/CentOS7's yum needs this plugin for the security
+            # filter below to work at all; harmless if already present.
+            - name: "[RedHat - yum] Ensure yum-plugin-security is present (RHEL7/CentOS7 only)"
+              yum:
+                name: yum-plugin-security
+                state: present
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "yum"
+              failed_when: false
+
+            # Let DNF/YUM/DNF5 enforce the security filter directly
+            # instead of us installing our own pre-computed name list —
+            # the officially supported, most authoritative method: it
+            # consults the same advisory data our scanner does, but the
+            # package manager applies it at install time rather than us
+            # pre-selecting names.
+            #   security: true      -> restrict candidates to security advisories
+            #   update_only: true   -> never installs a package that wasn't
+            #                          already installed (no new packages)
+            #   name: '*'           -> let the package manager determine
+            #                          which installed packages have a
+            #                          security update
+            #
+            # dnf5 is a from-scratch rewrite (not a version bump of dnf)
+            # and needs its own ansible.builtin.dnf5 module — it relies
+            # on python3-libdnf5 bindings, not the python3-dnf bindings
+            # the classic dnf module needs, so the two modules are not
+            # interchangeable even though the YAML looks almost the same.
+            - name: "[RedHat - dnf5] Install security updates only (DNF5-enforced filter)"
+              dnf5:
+                name: '*'
+                state: latest
+                security: true
+                update_only: true
+              register: apply_result_rh_dnf5
+              check_mode: "{{ dry_run | bool }}"
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "dnf5"
+
+            - name: "[RedHat - dnf] Install security updates only (DNF-enforced filter)"
+              dnf:
+                name: '*'
+                state: latest
+                security: true
+                update_only: true
+              register: apply_result_rh_dnf
+              check_mode: "{{ dry_run | bool }}"
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "dnf"
+
+            - name: "[RedHat - yum] Install security updates only (YUM-enforced filter)"
+              yum:
+                name: '*'
+                state: latest
+                security: true
+                update_only: true
+              register: apply_result_rh_yum
+              check_mode: "{{ dry_run | bool }}"
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "yum"
+
+            - name: Merge RHEL apply result (whichever of dnf5/dnf/yum actually ran)
+              set_fact:
+                apply_result_rh: >-
+                  {{
+                    apply_result_rh_dnf5
+                    if (apply_result_rh_dnf5 is defined and not (apply_result_rh_dnf5.skipped | default(false)))
+                    else apply_result_rh_dnf
+                    if (apply_result_rh_dnf is defined and not (apply_result_rh_dnf.skipped | default(false)))
+                    else apply_result_rh_yum
+                  }}
+              when: ansible_os_family == "RedHat"
+
+          rescue:
+            - name: Capture package installation failure (don't abort this host's run)
+              set_fact:
+                install_error: >-
+                  {{ (ansible_failed_result.msg | default('Package installation failed; see AWX job output for the failed task')) | truncate(500) }}
+
+            - name: Report installation failure and continue to reporting steps
+              debug:
+                msg: "Package installation failed on {{ inventory_hostname }}: {{ install_error }}"
+
+      always:
+        - name: Remove patch scanner script
+          file:
+            path: "{{ remote_scanner }}"
+            state: absent
+          ignore_errors: yes
+
+    - name: Note unsupported OS family
+      set_fact:
+        scan_error: "Unsupported ansible_os_family '{{ ansible_os_family }}' — no patch scan performed"
+      when: ansible_os_family not in ['Debian', 'RedHat']
+
+    # ───────────────────────────────────────────────────────────────────
+    # Reboot detection — authoritative OS-native check, not a package-name
+    # guess. A kernel-name match alone would miss other reboot-triggering
+    # packages (glibc, systemd, openssl in some cases, etc.) and can't
+    # tell you the OS's own opinion.
+    # ───────────────────────────────────────────────────────────────────
+    - name: "[Debian] Check if the OS reports a reboot is required"
+      stat:
+        path: /var/run/reboot-required
+      register: deb_reboot_check
+      when: ansible_os_family == "Debian"
+
+    - name: "[RedHat] Ensure needs-restarting helper is available"
+      package:
+        name: "{{ 'dnf-utils' if (ansible_pkg_mgr in ['dnf', 'dnf5']) else 'yum-utils' }}"
+        state: present
+      when: ansible_os_family == "RedHat"
+      failed_when: false
+
+    - name: "[RedHat] Check if the OS reports a reboot is required"
+      command: needs-restarting -r
+      register: rh_reboot_check
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: Determine whether a reboot is warranted (authoritative OS check)
+      set_fact:
+        reboot_required: >-
+          {{
+            (deb_reboot_check.stat.exists | default(false))
+            if ansible_os_family == "Debian"
+            else ((rh_reboot_check.rc | default(0)) == 1)
+            if ansible_os_family == "RedHat"
+            else false
+          }}
+
+    - name: Reboot host if the OS reports one is required
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Rebooting after security patch via AWX apply_security_patches_awx.yml"
+      when:
+        - reboot_if_required | bool
+        - reboot_required | bool
+        - not (dry_run | bool)
+        - (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false))
+
+    # ───────────────────────────────────────────────────────────────────
+    # Report + publish to AWX job stats — both per-host (for the AWX UI)
+    # and a single aggregated artifact (per_host: false, reliable for
+    # any external caller polling the API, e.g. the Patch Portal).
+    #
+    # Includes per-package old/new version and a run timestamp for each
+    # applied package, so the audit trail shows more than just a bare
+    # name list.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Build detailed applied-package log (old version, new version, run time)
+      set_fact:
+        security_patch_details: >-
+          {{
+            all_patches
+            | selectattr('name', 'in', security_packages)
+            | map('combine', {'installed_at': ansible_date_time.iso8601})
+            | list
+          }}
+
+    - name: Build consolidated CVE list (unique, sorted, across all patched packages)
+      set_fact:
+        security_patch_cves: >-
+          {{
+            (security_patch_details
+             | map(attribute='cves')
+             | select('string')
+             | select('!=', '')
+             | map('split', ',')
+             | list
+             | sum(start=[]))
+            | unique | sort
+          }}
+
+    - name: "Security patch summary: {{ inventory_hostname }}"
+      debug:
+        msg:
+          - "=========== SECURITY-ONLY PATCH: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}) ==========="
+          - "Mode              : {{ 'DRY RUN (nothing changed)' if (dry_run | bool) else 'APPLIED' }}"
+          - "Total security patches: {{ security_patch_details | length }}"
+          - "Non-security left : {{ (all_patches | length) - (security_packages | length) }} update(s) untouched"
+          - "CVEs addressed    : {{ (security_patch_cves | length) ~ ' — ' ~ (security_patch_cves | join(', ')) if security_patch_cves else '(none reported by vendor advisory for these packages)' }}"
+          - "Reboot required   : {{ reboot_required }}"
+          - "Install error     : {{ install_error if install_error else '(none)' }}"
+          - "======================================================================"
+
+    - name: "Security patches — {{ inventory_hostname }} ({{ security_patch_details | length }} total)"
+      debug:
+        msg: "{{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}{{ ' [' ~ item.cves ~ ']' if item.cves else ' [no CVE listed in advisory]' }}"
+      loop: "{{ security_patch_details }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (security_patch_details | length) > 0
+
+    - name: Store security patch report as a plain host fact (for aggregation)
+      set_fact:
+        security_apply_report_fact:
+          hostname:          "{{ inventory_hostname }}"
+          dry_run:           "{{ dry_run | bool }}"
+          security_patched:  "{{ security_patch_details }}"
+          cves_addressed:    "{{ security_patch_cves }}"
+          non_security_left: "{{ (all_patches | length) - (security_packages | length) }}"
+          changed:           "{{ (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false)) }}"
+          reboot_required:   "{{ reboot_required }}"
+          reboot_done:       "{{ (reboot_if_required | bool) and (reboot_required | bool) and not (dry_run | bool) }}"
+          install_error:     "{{ install_error }}"
+          scan_error:        "{{ scan_error }}"
+
+    - name: Publish per-host security patch report to AWX job stats
+      set_stats:
+        per_host: true
+        data:
+          security_apply_report: "{{ security_apply_report_fact }}"
+
+- name: Aggregate security patch reports into one reliable job-level artifact
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: no
+  tasks:
+    - name: Publish aggregated report (single job-level artifact)
+      run_once: true
+      delegate_to: localhost
+      set_stats:
+        per_host: false
+        data:
+          security_apply_report_all: >-
+            {{
+              dict(ansible_play_hosts
+                   | zip(ansible_play_hosts | map('extract', hostvars, 'security_apply_report_fact')))
+            }}
