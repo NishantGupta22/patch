@@ -3,26 +3,50 @@
 #
 # Self-contained AWX job: scans a host, identifies exactly which pending
 # updates fall in the SYSTEM bucket, and installs ONLY those. Everything
-# else — SECURITY, BUGFIX, ENHANCEMENT — is left untouched.
+# else — SECURITY, BUGFIX, ENHANCEMENT, and LIBRARY — is left untouched.
 #
-# SYSTEM means:
-#   Debian/Ubuntu/Kali — any pending update that is NOT confirmed to come
-#     from the distro's -security pocket. Debian/apt has no native
-#     bugfix-vs-enhancement advisory metadata, so "not security" is the
-#     whole definition here (matches list_patches_awx.yml's bucketing).
-#   RHEL/Alma/Rocky/CentOS Stream/Amazon/Oracle — any pending update that
-#     has NO matching advisory at all: not in `security` updateinfo, not
-#     `bugfix`, not `enhancement`. Typically a plain upstream version
-#     bump with no CVE or bugzilla ticket attached to it.
+# This is one of five mutually-exclusive, priority-ordered categories:
+#   1. Security     CVE/security advisories                 (highest priority)
+#   2. Bugfix        Bugfix advisories (RHEL family only)
+#   3. Enhancement   Enhancement/feature advisories (RHEL family only)
+#   4. Library       Shared libraries: name matches ^lib.* or *-libs
+#   5. System        Everything else — core OS packages (kernel, systemd,
+#                    util-linux, filesystem tools, networking, etc.)
+#                                                            (catch-all, lowest)
+# Every pending package falls into exactly one bucket, checked in that
+# order — e.g. a security update to a lib* package is still SECURITY,
+# not LIBRARY, since security takes priority. See
+# apply_library_patches_awx.yml for the library-only counterpart to this
+# playbook.
+#
+# Note on the Library heuristic: unlike SECURITY (which has an
+# authoritative advisory source and should never use name-guessing —
+# see the earlier removal of the Debian security name-heuristic),
+# "is this a shared library" has no such advisory-backed source to check
+# against. The naming convention (lib* / *-libs) IS the correct signal
+# for this category, by Debian Policy and RPM packaging convention — so
+# a name-based rule here is appropriate, not a shortcut. Known edge
+# case: a handful of packages start with "lib" but are application
+# suites, not shared libraries (e.g. libreoffice*, libvirt*) — accepted
+# as a limitation of this heuristic.
+#
+# SYSTEM means: not Security, not Bugfix, not Enhancement, and not
+# Library.
+#   Debian/Ubuntu/Kali — no bugfix/enhancement advisory metadata exists,
+#     so here it's simply: not -security-pocket, and not lib*/*-libs.
+#   RHEL/Alma/Rocky/CentOS Stream/Amazon/Oracle — no advisory at all
+#     (checked against updateinfo security/bugfix/enhancement), and not
+#     lib*/*-libs.
 #
 # IMPORTANT — why RHEL can't use a one-line DNF/YUM flag here the way the
 # security playbook does: dnf/yum's `security: true` and `bugfix: true`
 # filters only exist for advisory-backed categories. There is no native
-# "give me only the non-advisory leftovers" filter, so this playbook
-# determines the exact SYSTEM package list itself (same live-scan
-# approach as list_patches_awx.yml) and installs that explicit list with
-# `update_only: true` — it never installs a package that wasn't already
-# present, and it never touches a package with any advisory attached.
+# "give me only the non-advisory, non-library leftovers" filter, so this
+# playbook determines the exact SYSTEM package list itself (same
+# live-scan approach as list_patches_awx.yml) and installs that explicit
+# list with `update_only: true` — it never installs a package that
+# wasn't already present, and it never touches a package with any
+# advisory or a library-pattern name.
 #
 # No survey fields required beyond the three below — schedulable as-is.
 #
@@ -165,15 +189,28 @@
                   except Exception as exc:
                       return 1, "", str(exc)
 
+              # ── Shared library detection (used by both OS families) ──
+              # SYSTEM excludes LIBRARY packages, per the five-category
+              # scheme in list_patches_awx.yml. Name-pattern based since
+              # neither apt nor dnf/yum has an advisory-type flag for
+              # "this is a shared library" — the ^lib / -libs naming
+              # convention is the correct signal here (Debian Policy and
+              # RPM packaging convention), unlike SECURITY classification
+              # which must never rely on name-guessing.
+              LIBRARY_NAME_RE = re.compile(r"^lib[a-z0-9]|-libs?$", re.I)
+
+              def is_library_pkg(pkg):
+                  return bool(LIBRARY_NAME_RE.search(pkg))
+
               # ── Debian / Ubuntu / Kali ──────────────────────────────
               # Strict/authoritative classification, same basis as
               # apply_security_patches_awx.yml: a package is confirmed
               # SECURITY only if its candidate comes from the -security
-              # pocket (via apt-cache madison). SYSTEM is simply
-              # everything else — Debian/apt has no bugfix/enhancement
-              # advisory metadata to split further. Kali has no separate
-              # -security suite, so every pending Kali update is
-              # correctly classified SYSTEM here (nothing to exclude).
+              # pocket (via apt-cache madison). SYSTEM is everything else
+              # EXCEPT library-pattern packages, which are excluded here
+              # since they're covered by apply_library_patches_awx.yml
+              # instead. Kali has no separate -security suite, so Kali
+              # packages are classified purely on the library-name check.
 
               def get_apt_policy(pkgs):
                   rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
@@ -226,7 +263,7 @@
                           "-security" in src and (new_ver in ("unknown", "") or ver == new_ver)
                           for ver, src in madison.get(pkg, [])
                       )
-                      is_sys = not is_security_pocket
+                      is_sys = (not is_security_pocket) and (not is_library_pkg(pkg))
 
                       results.append({
                           "name": pkg, "current_version": cur_ver, "new_version": new_ver,
@@ -379,7 +416,7 @@
                           is_sys = False
                       else:
                           has_advisory = (pkg in security_pkgs) or (pkg in update_types)
-                          is_sys = not has_advisory
+                          is_sys = (not has_advisory) and (not is_library_pkg(pkg))
                       results.append({
                           "name": pkg,
                           "current_version": _fmt_version(i),
