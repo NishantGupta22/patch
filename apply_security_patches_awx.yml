@@ -48,6 +48,16 @@
 # below (security_patch_cves) and surfaced in the summary, the per-package
 # loop, and the per-host/aggregated job-stats report.
 #
+# RHEL CVE PARSING NOTE: dnf5's `updateinfo info` TEXT output is not the
+# same layout as classic dnf/yum's — it has no bare "CVEs:" line at all,
+# CVE references live in a References block instead. So on dnf5 hosts
+# (e.g. AlmaLinux/Rocky 9.4+, Fedora, newer RHEL clones) we call dnf5's
+# own `--json` output for updateinfo info and parse that structured
+# References array, instead of regexing text that was never in the
+# format the parser expected. Classic dnf/yum (RHEL7/8, Amazon, Oracle
+# where applicable) keep the original text-based CVEs: parser, which
+# matches their actual output.
+#
 # REBOOT DETECTION: uses the authoritative OS-native check rather than
 # guessing from package names — /var/run/reboot-required on Debian/Ubuntu
 # (written by the OS itself when a reboot is actually needed), and
@@ -381,12 +391,58 @@
                   flush()
                   return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
 
+              def parse_dnf5_updateinfo_json(raw_json):
+                  """
+                  dnf5's `updateinfo info` TEXT output is a different
+                  layout than classic dnf/yum — it has no bare "CVEs:"
+                  line; CVE references live in a References block
+                  instead (Title/Id/Type/Url per reference). The
+                  classic-format regex parser above can never match that
+                  layout, which is why CVEs silently came back empty on
+                  dnf5 hosts (AlmaLinux/Rocky 9.4+, Fedora, newer RHEL
+                  clones) even though security classification itself was
+                  correct. dnf5 ships a first-class --json mode for this
+                  exact data, so we parse that instead of guessing at its
+                  text format.
+
+                  Expected shape (dnf5 `advisory info --json`): a JSON
+                  array of advisory objects, each with a `references`
+                  array of {Id, Type, ...} and a `collections.packages`
+                  array of affected NEVRAs.
+                  """
+                  cve_map = {}
+                  try:
+                      advisories = json.loads(raw_json)
+                  except (ValueError, TypeError):
+                      return cve_map
+                  if not isinstance(advisories, list):
+                      return cve_map
+                  for adv in advisories:
+                      if not isinstance(adv, dict):
+                          continue
+                      refs = adv.get("references") or []
+                      cves = sorted({
+                          r.get("Id") for r in refs
+                          if isinstance(r, dict)
+                          and str(r.get("Type", "")).lower() == "cve"
+                          and r.get("Id")
+                      })
+                      if not cves:
+                          continue
+                      pkgs = ((adv.get("collections") or {}).get("packages")) or []
+                      for nevra in pkgs:
+                          name = strip_nevra(nevra)
+                          if name:
+                              cve_map.setdefault(name, set()).update(cves)
+                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
+
               RH_SKIP_UPDATEINFO_DISTROS = {"amazon", "amazonlinux", "oraclelinux", "oracle"}
 
               def scan_redhat(distro=""):
                   mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
                   if not mgr:
                       return []
+                  is_dnf5 = os.path.basename(mgr) == "dnf5"
                   skip_updateinfo = distro.lower().replace(" ", "") in RH_SKIP_UPDATEINFO_DISTROS
 
                   rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
@@ -408,10 +464,24 @@
                       if len(parts) >= 3:
                           security_pkgs.add(strip_nevra(parts[-1]))
 
+                  # CVE lookup: dnf5's `updateinfo info` text layout uses a
+                  # References block instead of classic dnf/yum's "CVEs:"
+                  # line, so it gets its own JSON-based path (dnf5 ships a
+                  # first-class --json mode for exactly this data). Classic
+                  # dnf/yum keep the original text parser, which matches
+                  # their actual field format.
                   cve_map = {}
                   if not skip_updateinfo:
-                      _, secinfo_out, _ = run([mgr, "-q", "updateinfo", "info", "security", "--available"], timeout=180)
-                      cve_map = parse_updateinfo_cves(secinfo_out)
+                      if is_dnf5:
+                          rc_ci, secinfo_json, _ = run(
+                              [mgr, "-q", "updateinfo", "info", "security", "--available", "--json"],
+                              timeout=180,
+                          )
+                          if rc_ci == 0 and secinfo_json.strip():
+                              cve_map = parse_dnf5_updateinfo_json(secinfo_json)
+                      else:
+                          _, secinfo_out, _ = run([mgr, "-q", "updateinfo", "info", "security", "--available"], timeout=180)
+                          cve_map = parse_updateinfo_cves(secinfo_out)
 
                   def _fmt_version(info):
                       ver, rel = info.get("Version", ""), info.get("Release", "")
@@ -644,7 +714,7 @@
     # Reboot detection — authoritative OS-native check, not a package-name
     # guess. A kernel-name match alone would miss other reboot-triggering
     # packages (glibc, systemd, openssl in some cases, etc.) and can't
-    # tell you the OS's own assessment.
+    # tell you the OS's own opinion.
     # ───────────────────────────────────────────────────────────────────
     - name: "[Debian] Check if the OS reports a reboot is required"
       stat:
