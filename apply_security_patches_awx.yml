@@ -48,15 +48,43 @@
 # below (security_patch_cves) and surfaced in the summary, the per-package
 # loop, and the per-host/aggregated job-stats report.
 #
+# SEVERITY REPORTING: every SECURITY package also gets a normalized
+# `severity` field — Critical / Important / Moderate / Low / Unknown —
+# so the report reads the same way `dnf updateinfo list security` does
+# (e.g. "ALSA-2026:28911 Moderate/Sec. coreutils-...").
+#   RHEL family — severity comes straight from the same
+#     `updateinfo list security` advisory listing already used to build
+#     the security package set (see parse_advisory_id_to_packages_and_
+#     severity below), for classic dnf/yum, dnf5, and Amazon/Oracle
+#     alike — it needs no extra command, so it isn't affected by the
+#     RH_SKIP_UPDATEINFO_DISTROS CVE-detail skip.
+#   Debian/Ubuntu — Debian/Ubuntu security advisories (DSA/USN) don't
+#     expose a CVSS-style severity rating through apt tooling at all.
+#     As a best-effort proxy, the scanner reads the `urgency=` field
+#     from the newest debian/changelog entry (low/medium/high/
+#     emergency/critical) and maps it onto the same Low/Moderate/
+#     Important/Critical scale. This is the maintainer's upload
+#     urgency, NOT an independent vulnerability severity score — treat
+#     it as a rough signal, not a CVSS-equivalent rating. It's reported
+#     as "Unknown" whenever the field can't be parsed.
+#   Kali — no -security suite and no advisory severity source at all;
+#     always reported "Unknown" for consistency with the rest of the
+#     Debian-family scan (see is_kali handling below).
+# A per-host severity breakdown (Critical/Important/Moderate/Low/Unknown
+# counts) is built below (security_patch_severity_counts) and surfaced
+# in the summary and the per-host/aggregated job-stats report, same as
+# the CVE list.
+#
 # RHEL CVE PARSING NOTE: dnf5's `updateinfo info` TEXT output is not the
-# same layout as classic dnf/yum's — it has no bare "CVEs:" line at all,
+# same layout as classic dnf/yum — it has no bare "CVEs:" line at all,
 # CVE references live in a References block instead. So on dnf5 hosts
 # (e.g. AlmaLinux/Rocky 9.4+, Fedora, newer RHEL clones) we call dnf5's
 # own `--json` output for updateinfo info and parse that structured
 # References array, instead of regexing text that was never in the
 # format the parser expected. Classic dnf/yum (RHEL7/8, Amazon, Oracle
 # where applicable) keep the original text-based CVEs: parser, which
-# matches their actual output.
+# matches their actual output. Severity does NOT need this dnf5-specific
+# handling — see SEVERITY REPORTING above.
 #
 # REBOOT DETECTION: uses the authoritative OS-native check rather than
 # guessing from package names — /var/run/reboot-required on Debian/Ubuntu
@@ -75,7 +103,8 @@
 # as before) — override via survey/extra_vars (e.g. 10, or '20%') when
 # rolling out across a large fleet to limit blast radius.
 #
-# Compatibility: Ubuntu/Debian/Kali (apt) and RHEL family (dnf/yum/dnf5),
+# Compatibility: Ubuntu/Debian/Kali (apt) and RHEL family
+# (dnf/yum/dnf5, including AlmaLinux/Rocky/Amazon Linux/Oracle Linux),
 # matching list_patches_awx.yml and apply_patches_awx.yml.
 
 - name: Apply Security Patches Only (AWX)
@@ -160,7 +189,10 @@
     # ───────────────────────────────────────────────────────────────────
     # Scan — identical classification logic to list_patches_awx.yml, so
     # "security" here always matches what your list job would show as
-    # [SECURITY]. Never installs or modifies anything by itself.
+    # [SECURITY]. Never installs or modifies anything by itself. Also
+    # attaches a normalized severity (Critical/Important/Moderate/Low/
+    # Unknown) and CVE list to each SECURITY package — see SEVERITY
+    # REPORTING and CVE REPORTING notes at the top of this file.
     # ───────────────────────────────────────────────────────────────────
     - name: Scan and apply security-only patches
       when: ansible_os_family in ['Debian', 'RedHat']
@@ -175,9 +207,11 @@
               #!/usr/bin/env python3
               """
               patch_scanner.py — used by apply_security_patches_awx.yml to
-              identify which pending updates are SECURITY. Same
-              classification logic as list_patches_awx.yml. Never installs
-              or modifies packages; always exits 0 and prints valid JSON.
+              identify which pending updates are SECURITY, and attach a
+              normalized severity (Critical/Important/Moderate/Low/Unknown)
+              and CVE list to each one. Same classification logic as
+              list_patches_awx.yml. Never installs or modifies packages;
+              always exits 0 and prints valid JSON.
               """
 
               import json, os, re, shutil, subprocess, sys
@@ -188,7 +222,32 @@
               ARCH_SUFFIX_RE = re.compile(
                   r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
               )
-              VER_REL_RE = re.compile(r"-[^-:]+-[^-:]+$")
+
+              # ── Severity normalization (shared by Debian + RHEL paths) ─
+              # Canonical scale used everywhere in this scanner's output:
+              # Critical > Important > Moderate > Low > Unknown. RHEL's
+              # own advisory severities already use this vocabulary
+              # verbatim (see `dnf updateinfo list security`); Debian's
+              # changelog `urgency=` field is mapped onto it as a
+              # best-effort proxy (see debian_urgency below).
+              _SEVERITY_RANK = {"low": 1, "moderate": 2, "important": 3, "critical": 4}
+              _SEVERITY_CANON = {
+                  "low": "Low", "moderate": "Moderate",
+                  "important": "Important", "critical": "Critical",
+              }
+
+              def normalize_severity(raw):
+                  """'Moderate/Sec.' / 'Important' / '' -> canonical label or 'Unknown'."""
+                  if not raw:
+                      return "Unknown"
+                  key = raw.strip().lower().split("/")[0].strip()
+                  return _SEVERITY_CANON.get(key, "Unknown")
+
+              def higher_severity(a, b):
+                  """Returns whichever of two severity labels ranks higher."""
+                  ra = _SEVERITY_RANK.get((a or "").lower(), 0)
+                  rb = _SEVERITY_RANK.get((b or "").lower(), 0)
+                  return a if ra >= rb else b
 
               def run(cmd, timeout=180):
                   try:
@@ -242,13 +301,28 @@
               def debian_is_security(is_security_pocket):
                   return bool(is_security_pocket)
 
+              # Package upload urgency -> our canonical severity scale.
+              # See the SEVERITY REPORTING note at the top of the
+              # playbook: this is a proxy, not a CVSS-equivalent score.
+              _DEBIAN_URGENCY_MAP = {
+                  "low": "Low", "medium": "Moderate",
+                  "high": "Important", "critical": "Critical", "emergency": "Critical",
+              }
 
-
-              def debian_cves(pkg, timeout=6):
+              def debian_changelog_lookup(pkg, timeout=6):
+                  """
+                  One `apt-get changelog` call, reused for both CVEs and a
+                  best-effort severity proxy, so we don't fetch the same
+                  changelog twice per package.
+                  Returns (cves, severity).
+                  """
                   rc, out, _ = run(["apt-get", "changelog", pkg], timeout=timeout)
                   if rc != 0:
-                      return ""
-                  return ",".join(sorted(set(re.findall(r"CVE-\d{4}-\d+", out))))
+                      return "", "Unknown"
+                  cves = ",".join(sorted(set(re.findall(r"CVE-\d{4}-\d+", out))))
+                  m = re.search(r"urgency=(\w+)", out, re.I)
+                  severity = _DEBIAN_URGENCY_MAP.get(m.group(1).lower(), "Unknown") if m else "Unknown"
+                  return cves, severity
 
               def scan_debian(distro=""):
                   is_kali = distro.lower() == "kali"
@@ -283,23 +357,62 @@
                       )
                       is_sec = debian_is_security(is_security_pocket)
 
-                      cves = ""
-                      if is_sec and FETCH_CVES and cve_lookups < DETAIL_LIMIT:
+                      # Kali has no advisory severity source at all (see
+                      # module docstring above); every other Debian-family
+                      # host gets a best-effort urgency-based severity.
+                      cves, severity = "", ("Unknown" if (is_sec and not is_kali) else "N/A")
+                      if is_sec and not is_kali and FETCH_CVES and cve_lookups < DETAIL_LIMIT:
                           cve_lookups += 1
-                          cves = debian_cves(pkg)
+                          cves, severity = debian_changelog_lookup(pkg)
 
                       results.append({
                           "name": pkg, "current_version": cur_ver, "new_version": new_ver,
-                          "is_security": is_sec, "cves": cves,
+                          "is_security": is_sec, "cves": cves, "severity": severity,
                       })
                   return results
 
               # ── RHEL / CentOS / AlmaLinux / Rocky / Amazon / Oracle ──
+              def strip_arch(name_dot_arch):
+                  """
+                  For `dnf/yum check-update`'s first column, which is just
+                  'name.arch' with no version attached at all (e.g.
+                  'kernel-tools-libs.x86_64'). Only the trailing '.arch'
+                  is stripped here — deliberately NOT run through
+                  strip_nevra()'s dash-splitting, because a package name
+                  can legitimately contain two or more dashes on its own
+                  (kernel-tools-libs, dracut-config-rescue,
+                  samba-client-libs, rubygem-io-console, ...). Treating
+                  those as if they were trailing version/release segments
+                  truncates the name (e.g. down to just 'kernel'), which
+                  then fails to match against the correctly-parsed full
+                  name from the security advisory list and silently drops
+                  that package out of the SECURITY classification.
+                  """
+                  return ARCH_SUFFIX_RE.sub("", name_dot_arch)
+
               def strip_nevra(nevra):
+                  """
+                  Extracts the package name from a full NEVRA string, e.g.
+                  'coreutils-8.32-41.el9_8.x86_64' -> 'coreutils', or an
+                  epoch-bearing one like
+                  'NetworkManager-1:1.54.3-2.el9.x86_64' -> 'NetworkManager'.
+
+                  Uses rsplit('-', 2) rather than a regex: the epoch (when
+                  present) is embedded mid-string as 'name-EPOCH:version-
+                  release' — not as a leading 'EPOCH:name-...' prefix — so
+                  a regex anchored on '-X-Y$' with a [^-:] character class
+                  (as this used to be) fails to match at all whenever the
+                  version segment contains a ':', leaving the epoch and
+                  version glued onto what should have been just the name
+                  (e.g. wrongly yielding 'NetworkManager-1'). rsplit avoids
+                  that: it always peels off exactly the last two dash-
+                  separated segments (version, release) regardless of what
+                  characters they contain, which also correctly preserves
+                  multi-dash names like 'libssh-config'.
+                  """
                   name = ARCH_SUFFIX_RE.sub("", nevra)
-                  name = VER_REL_RE.sub("", name)
-                  name = re.sub(r"^\d+:", "", name)
-                  return name.split(":")[0]
+                  parts = name.rsplit("-", 2)
+                  return parts[0] if len(parts) == 3 else name
 
               def parse_check_update(text):
                   SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Loading mirror", "Security:", "Added Packages")
@@ -322,7 +435,7 @@
                       parts = line.split()
                       if len(parts) < 2:
                           continue
-                      name = strip_nevra(parts[0])
+                      name = strip_arch(parts[0])
                       if not name or re.match(r"^\d", name):
                           continue
                       pkgs.append(name)
@@ -357,39 +470,79 @@
                       result.setdefault(block["Name"], block)
                   return result
 
-              def parse_updateinfo_cves(text):
-                  cve_map, cves, pkgs, in_pkgs = {}, [], [], False
-                  BLOCK_SEP_RE = re.compile(r"^(={3,}|(Name|Update\s*ID)\s*:)", re.I)
-                  CVE_FIELD_RE = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
-                  CVE_BARE_RE  = re.compile(r"^(CVE-\d{4}-\d+)", re.I)
-                  PKG_HDR_RE   = re.compile(r"^(Updated|Affected|Fixed)\s+[Pp]ackages\s*:", re.I)
-                  FIELD_RE     = re.compile(r"^\w[\w\s]+\s*:")
-                  def flush():
-                      if cves and pkgs:
-                          for p in pkgs:
-                              n = strip_nevra(p)
-                              if n:
-                                  cve_map.setdefault(n, set()).update(cves)
-                  for raw in text.splitlines():
+              def parse_advisory_id_to_packages_and_severity(list_text):
+                  """
+                  Builds, from a single pass over `updateinfo list security`
+                  output such as:
+                      ALSA-2026:28911 Moderate/Sec.  coreutils-8.32-41.el9_8.x86_64
+                  both {advisory_id: {package_name, ...}} (used to join CVEs
+                  to packages, see parse_advisory_cves — this is the exact
+                  same source security_pkgs is built from, confirmed to
+                  match `dnf updateinfo list security` 1:1) AND
+                  {advisory_id: severity}, taken straight from the
+                  "Moderate/Sec." style column. This is the ONLY place
+                  severity is read from for RHEL-family hosts — it works
+                  identically for classic dnf/yum, dnf5, and Amazon/Oracle,
+                  since it needs no extra `updateinfo info` call (unlike
+                  CVE detail lookups, which dnf5 and Amazon/Oracle each
+                  need special-cased — see below).
+                  """
+                  pkg_mapping, sev_mapping = {}, {}
+                  for raw in list_text.splitlines():
+                      parts = raw.split()
+                      if len(parts) < 3:
+                          continue
+                      advisory_id, sev_field, nevra = parts[0], parts[1], parts[-1]
+                      name = strip_nevra(nevra)
+                      if name:
+                          pkg_mapping.setdefault(advisory_id, set()).add(name)
+                      sev = normalize_severity(sev_field)
+                      if sev != "Unknown":
+                          sev_mapping[advisory_id] = sev
+                  return pkg_mapping, sev_mapping
+
+              def parse_advisory_cves(info_text):
+                  """
+                  Builds {advisory_id: {cve, ...}} from `updateinfo info
+                  security` output. Classic dnf/yum wrap a CVEs: field with
+                  more than one CVE onto continuation lines that repeat
+                  only a bare ':' at the same indent, e.g.:
+                      CVEs: CVE-2026-4046
+                          : CVE-2026-4437
+                          : CVE-2026-4438
+                  Those continuation lines don't start with "CVEs" or
+                  "CVE-", so they need their own branch or every CVE past
+                  the first one on a wrapped advisory is silently dropped.
+                  """
+                  ADVISORY_ID_RE = re.compile(r"^Update\s*ID\s*:\s*(\S+)", re.I)
+                  CVE_FIELD_RE   = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
+                  CVE_CONT_RE    = re.compile(r"^:\s*(.*)")
+                  result, cur_id, in_cves = {}, None, False
+                  for raw in info_text.splitlines():
                       line = raw.strip()
                       if not line:
                           continue
-                      if BLOCK_SEP_RE.match(line):
-                          flush(); cves, pkgs, in_pkgs = [], [], False
+                      m = ADVISORY_ID_RE.match(line)
+                      if m:
+                          cur_id = m.group(1)
+                          in_cves = False
                           continue
                       m = CVE_FIELD_RE.match(line)
                       if m:
-                          cves += re.findall(r"CVE-\d{4}-\d+", m.group(1)); continue
-                      if not in_pkgs and CVE_BARE_RE.match(line):
-                          cves += re.findall(r"CVE-\d{4}-\d+", line); continue
-                      if PKG_HDR_RE.match(line):
-                          in_pkgs = True; continue
-                      if FIELD_RE.match(line) and not CVE_FIELD_RE.match(line):
-                          in_pkgs = False; continue
-                      if in_pkgs and line:
-                          pkgs.append(line)
-                  flush()
-                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
+                          found = re.findall(r"CVE-\d{4}-\d+", m.group(1))
+                          if cur_id and found:
+                              result.setdefault(cur_id, set()).update(found)
+                          in_cves = True
+                          continue
+                      if in_cves:
+                          m2 = CVE_CONT_RE.match(line)
+                          if m2:
+                              found = re.findall(r"CVE-\d{4}-\d+", m2.group(1))
+                              if cur_id and found:
+                                  result.setdefault(cur_id, set()).update(found)
+                              continue
+                          in_cves = False
+                  return result
 
               def parse_dnf5_updateinfo_json(raw_json):
                   """
@@ -403,7 +556,9 @@
                   clones) even though security classification itself was
                   correct. dnf5 ships a first-class --json mode for this
                   exact data, so we parse that instead of guessing at its
-                  text format.
+                  text format. (Severity does NOT need this — it's read
+                  from `updateinfo list security` for every RHEL variant,
+                  see parse_advisory_id_to_packages_and_severity.)
 
                   Expected shape (dnf5 `advisory info --json`): a JSON
                   array of advisory objects, each with a `references`
@@ -457,19 +612,35 @@
                   _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
                   installed = parse_pkg_info(inst_out, only_section="installed")
 
+                  # security_pkgs + severity both come from this single
+                  # `updateinfo list security` call — works the same for
+                  # classic dnf/yum, dnf5, and Amazon/Oracle, and is
+                  # unaffected by the CVE-detail skip below.
                   _, seclist_out, _ = run([mgr, "-q", "updateinfo", "list", "security", "--available"], timeout=180)
+                  advisory_pkgs, advisory_severity = parse_advisory_id_to_packages_and_severity(seclist_out)
+
                   security_pkgs = set()
-                  for raw in seclist_out.splitlines():
-                      parts = raw.split()
-                      if len(parts) >= 3:
-                          security_pkgs.add(strip_nevra(parts[-1]))
+                  pkg_severity = {}
+                  for adv_id, names in advisory_pkgs.items():
+                      sev = advisory_severity.get(adv_id, "Unknown")
+                      for name in names:
+                          security_pkgs.add(name)
+                          pkg_severity[name] = higher_severity(pkg_severity.get(name, "Unknown"), sev)
 
                   # CVE lookup: dnf5's `updateinfo info` text layout uses a
                   # References block instead of classic dnf/yum's "CVEs:"
                   # line, so it gets its own JSON-based path (dnf5 ships a
-                  # first-class --json mode for exactly this data). Classic
-                  # dnf/yum keep the original text parser, which matches
-                  # their actual field format.
+                  # first-class --json mode for exactly this data).
+                  #
+                  # Classic dnf/yum: join CVEs to packages through the
+                  # advisory ID instead of parsing a package-list section
+                  # out of `info` output. advisory_pkgs (already parsed
+                  # above from the same seclist_out, confirmed to match
+                  # `updateinfo list security` 1:1) already gives us
+                  # {advisory_id -> packages} reliably; parse_advisory_cves
+                  # only needs to extract {advisory_id -> CVEs} from
+                  # `info`, which is a much narrower, less format-sensitive
+                  # task.
                   cve_map = {}
                   if not skip_updateinfo:
                       if is_dnf5:
@@ -481,7 +652,12 @@
                               cve_map = parse_dnf5_updateinfo_json(secinfo_json)
                       else:
                           _, secinfo_out, _ = run([mgr, "-q", "updateinfo", "info", "security", "--available"], timeout=180)
-                          cve_map = parse_updateinfo_cves(secinfo_out)
+                          advisory_cves = parse_advisory_cves(secinfo_out)
+                          pkg_cves = {}
+                          for adv_id, cves in advisory_cves.items():
+                              for pkg_name in advisory_pkgs.get(adv_id, ()):
+                                  pkg_cves.setdefault(pkg_name, set()).update(cves)
+                          cve_map = {k: ",".join(sorted(v)) for k, v in pkg_cves.items()}
 
                   def _fmt_version(info):
                       ver, rel = info.get("Version", ""), info.get("Release", "")
@@ -494,12 +670,14 @@
                   results = []
                   for pkg in pkgs:
                       a, i = avail.get(pkg, {}), installed.get(pkg, {})
+                      is_sec = pkg in security_pkgs
                       results.append({
                           "name": pkg,
                           "current_version": _fmt_version(i),
                           "new_version": _fmt_version(a),
-                          "is_security": pkg in security_pkgs,
+                          "is_security": is_sec,
                           "cves": cve_map.get(pkg, ""),
+                          "severity": pkg_severity.get(pkg, "Unknown") if is_sec else "N/A",
                       })
                   return results
 
@@ -762,11 +940,11 @@
     # and a single aggregated artifact (per_host: false, reliable for
     # any external caller polling the API, e.g. the Patch Portal).
     #
-    # Includes per-package old/new version and a run timestamp for each
-    # applied package, so the audit trail shows more than just a bare
-    # name list.
+    # Includes per-package old/new version, severity, CVEs, and a run
+    # timestamp for each applied package, so the audit trail shows more
+    # than just a bare name list.
     # ───────────────────────────────────────────────────────────────────
-    - name: Build detailed applied-package log (old version, new version, run time)
+    - name: Build detailed applied-package log (old version, new version, severity, run time)
       set_fact:
         security_patch_details: >-
           {{
@@ -790,12 +968,22 @@
             | unique | sort
           }}
 
+    - name: "Build severity breakdown (Critical / Important / Moderate / Low / Unknown)"
+      set_fact:
+        security_patch_severity_counts:
+          Critical:  "{{ security_patch_details | selectattr('severity', 'equalto', 'Critical')  | list | length }}"
+          Important: "{{ security_patch_details | selectattr('severity', 'equalto', 'Important') | list | length }}"
+          Moderate:  "{{ security_patch_details | selectattr('severity', 'equalto', 'Moderate')  | list | length }}"
+          Low:       "{{ security_patch_details | selectattr('severity', 'equalto', 'Low')       | list | length }}"
+          Unknown:   "{{ security_patch_details | selectattr('severity', 'equalto', 'Unknown')   | list | length }}"
+
     - name: "Security patch summary: {{ inventory_hostname }}"
       debug:
         msg:
           - "=========== SECURITY-ONLY PATCH: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}) ==========="
           - "Mode              : {{ 'DRY RUN (nothing changed)' if (dry_run | bool) else 'APPLIED' }}"
           - "Total security patches: {{ security_patch_details | length }}"
+          - "Severity breakdown: Critical={{ security_patch_severity_counts.Critical }}  Important={{ security_patch_severity_counts.Important }}  Moderate={{ security_patch_severity_counts.Moderate }}  Low={{ security_patch_severity_counts.Low }}  Unknown={{ security_patch_severity_counts.Unknown }}"
           - "Non-security left : {{ (all_patches | length) - (security_packages | length) }} update(s) untouched"
           - "CVEs addressed    : {{ (security_patch_cves | length) ~ ' — ' ~ (security_patch_cves | join(', ')) if security_patch_cves else '(none reported by vendor advisory for these packages)' }}"
           - "Reboot required   : {{ reboot_required }}"
@@ -804,25 +992,29 @@
 
     - name: "Security patches — {{ inventory_hostname }} ({{ security_patch_details | length }} total)"
       debug:
-        msg: "{{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}{{ ' [' ~ item.cves ~ ']' if item.cves else ' [no CVE listed in advisory]' }}"
+        msg: >-
+          {{ '%-10s' | format(item.severity ~ '/Sec.') }}
+          {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
+          {{ '[' ~ item.cves ~ ']' if item.cves else '[no CVE listed in advisory]' }}
       loop: "{{ security_patch_details }}"
       loop_control:
-        label: "{{ item.name }}"
+        label: "{{ item.name }} ({{ item.severity }})"
       when: (security_patch_details | length) > 0
 
     - name: Store security patch report as a plain host fact (for aggregation)
       set_fact:
         security_apply_report_fact:
-          hostname:          "{{ inventory_hostname }}"
-          dry_run:           "{{ dry_run | bool }}"
-          security_patched:  "{{ security_patch_details }}"
-          cves_addressed:    "{{ security_patch_cves }}"
-          non_security_left: "{{ (all_patches | length) - (security_packages | length) }}"
-          changed:           "{{ (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false)) }}"
-          reboot_required:   "{{ reboot_required }}"
-          reboot_done:       "{{ (reboot_if_required | bool) and (reboot_required | bool) and not (dry_run | bool) }}"
-          install_error:     "{{ install_error }}"
-          scan_error:        "{{ scan_error }}"
+          hostname:            "{{ inventory_hostname }}"
+          dry_run:             "{{ dry_run | bool }}"
+          security_patched:    "{{ security_patch_details }}"
+          cves_addressed:      "{{ security_patch_cves }}"
+          severity_counts:     "{{ security_patch_severity_counts }}"
+          non_security_left:   "{{ (all_patches | length) - (security_packages | length) }}"
+          changed:             "{{ (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false)) }}"
+          reboot_required:     "{{ reboot_required }}"
+          reboot_done:         "{{ (reboot_if_required | bool) and (reboot_required | bool) and not (dry_run | bool) }}"
+          install_error:       "{{ install_error }}"
+          scan_error:          "{{ scan_error }}"
 
     - name: Publish per-host security patch report to AWX job stats
       set_stats:
@@ -834,6 +1026,26 @@
   hosts: "{{ target_hosts | default('all') }}"
   gather_facts: no
   tasks:
+    - name: Build fleet-wide severity totals (across all hosts in this run)
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        fleet_severity_counts:
+          Critical:  "{{ hostvars | dict2items | selectattr('value.security_apply_report_fact', 'defined') | map(attribute='value.security_apply_report_fact.severity_counts.Critical') | map('int') | sum }}"
+          Important: "{{ hostvars | dict2items | selectattr('value.security_apply_report_fact', 'defined') | map(attribute='value.security_apply_report_fact.severity_counts.Important') | map('int') | sum }}"
+          Moderate:  "{{ hostvars | dict2items | selectattr('value.security_apply_report_fact', 'defined') | map(attribute='value.security_apply_report_fact.severity_counts.Moderate') | map('int') | sum }}"
+          Low:       "{{ hostvars | dict2items | selectattr('value.security_apply_report_fact', 'defined') | map(attribute='value.security_apply_report_fact.severity_counts.Low') | map('int') | sum }}"
+          Unknown:   "{{ hostvars | dict2items | selectattr('value.security_apply_report_fact', 'defined') | map(attribute='value.security_apply_report_fact.severity_counts.Unknown') | map('int') | sum }}"
+
+    - name: "Fleet-wide security patch severity totals"
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg:
+          - "=========== FLEET SECURITY PATCH TOTALS ({{ ansible_play_hosts | length }} host(s)) ==========="
+          - "Critical={{ fleet_severity_counts.Critical }}  Important={{ fleet_severity_counts.Important }}  Moderate={{ fleet_severity_counts.Moderate }}  Low={{ fleet_severity_counts.Low }}  Unknown={{ fleet_severity_counts.Unknown }}"
+          - "======================================================================"
+
     - name: Publish aggregated report (single job-level artifact)
       run_once: true
       delegate_to: localhost
@@ -845,3 +1057,4 @@
               dict(ansible_play_hosts
                    | zip(ansible_play_hosts | map('extract', hostvars, 'security_apply_report_fact')))
             }}
+          security_apply_severity_totals: "{{ fleet_severity_counts }}"
