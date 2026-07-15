@@ -35,6 +35,19 @@
 # In both cases the scanner's security_packages list still drives the
 # human-readable report and the dry-run preview.
 #
+# CVE REPORTING: the scanner attaches a comma-separated `cves` field to
+# each SECURITY package where the vendor advisory names one (Debian via
+# `apt-get changelog`, RHEL via `dnf/yum updateinfo info security`). Not
+# every SECURITY package will have a CVE listed — some advisories don't
+# reference a CVE at all, and the changelog/updateinfo parse can come up
+# empty (e.g. FETCH_CVES disabled, Amazon/Oracle's updateinfo skip). CVEs
+# are reporting-only: they never influence whether a package gets
+# patched — that decision is entirely the vendor's SECURITY
+# classification (see INSTALL ENFORCEMENT above). A consolidated,
+# deduplicated CVE list across all patched packages on the host is built
+# below (security_patch_cves) and surfaced in the summary, the per-package
+# loop, and the per-host/aggregated job-stats report.
+#
 # REBOOT DETECTION: uses the authoritative OS-native check rather than
 # guessing from package names — /var/run/reboot-required on Debian/Ubuntu
 # (written by the OS itself when a reboot is actually needed), and
@@ -693,6 +706,20 @@
             | list
           }}
 
+    - name: Build consolidated CVE list (unique, sorted, across all patched packages)
+      set_fact:
+        security_patch_cves: >-
+          {{
+            (security_patch_details
+             | map(attribute='cves')
+             | select('string')
+             | select('!=', '')
+             | map('split', ',')
+             | list
+             | sum(start=[]))
+            | unique | sort
+          }}
+
     - name: "Security patch summary: {{ inventory_hostname }}"
       debug:
         msg:
@@ -700,13 +727,14 @@
           - "Mode              : {{ 'DRY RUN (nothing changed)' if (dry_run | bool) else 'APPLIED' }}"
           - "Total security patches: {{ security_patch_details | length }}"
           - "Non-security left : {{ (all_patches | length) - (security_packages | length) }} update(s) untouched"
+          - "CVEs addressed    : {{ (security_patch_cves | length) ~ ' — ' ~ (security_patch_cves | join(', ')) if security_patch_cves else '(none reported by vendor advisory for these packages)' }}"
           - "Reboot required   : {{ reboot_required }}"
           - "Install error     : {{ install_error if install_error else '(none)' }}"
           - "======================================================================"
 
     - name: "Security patches — {{ inventory_hostname }} ({{ security_patch_details | length }} total)"
       debug:
-        msg: "{{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}{{ ' [' ~ item.cves ~ ']' if item.cves else '' }}"
+        msg: "{{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}{{ ' [' ~ item.cves ~ ']' if item.cves else ' [no CVE listed in advisory]' }}"
       loop: "{{ security_patch_details }}"
       loop_control:
         label: "{{ item.name }}"
@@ -718,6 +746,7 @@
           hostname:          "{{ inventory_hostname }}"
           dry_run:           "{{ dry_run | bool }}"
           security_patched:  "{{ security_patch_details }}"
+          cves_addressed:    "{{ security_patch_cves }}"
           non_security_left: "{{ (all_patches | length) - (security_packages | length) }}"
           changed:           "{{ (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false)) }}"
           reboot_required:   "{{ reboot_required }}"
