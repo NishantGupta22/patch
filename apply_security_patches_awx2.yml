@@ -188,8 +188,6 @@
               ARCH_SUFFIX_RE = re.compile(
                   r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
               )
-              VER_REL_RE = re.compile(r"-[^-:]+-[^-:]+$")
-
               def run(cmd, timeout=180):
                   try:
                       proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -295,11 +293,47 @@
                   return results
 
               # ── RHEL / CentOS / AlmaLinux / Rocky / Amazon / Oracle ──
+              def strip_arch(name_dot_arch):
+                  """
+                  For `dnf/yum check-update`'s first column, which is just
+                  'name.arch' with no version attached at all (e.g.
+                  'kernel-tools-libs.x86_64'). Only the trailing '.arch'
+                  is stripped here — deliberately NOT run through
+                  strip_nevra()'s dash-splitting, because a package name
+                  can legitimately contain two or more dashes on its own
+                  (kernel-tools-libs, dracut-config-rescue,
+                  samba-client-libs, rubygem-io-console, ...). Treating
+                  those as if they were trailing version/release segments
+                  truncates the name (e.g. down to just 'kernel'), which
+                  then fails to match against the correctly-parsed full
+                  name from the security advisory list and silently drops
+                  that package out of the SECURITY classification.
+                  """
+                  return ARCH_SUFFIX_RE.sub("", name_dot_arch)
+
               def strip_nevra(nevra):
+                  """
+                  Extracts the package name from a full NEVRA string, e.g.
+                  'coreutils-8.32-41.el9_8.x86_64' -> 'coreutils', or an
+                  epoch-bearing one like
+                  'NetworkManager-1:1.54.3-2.el9.x86_64' -> 'NetworkManager'.
+
+                  Uses rsplit('-', 2) rather than a regex: the epoch (when
+                  present) is embedded mid-string as 'name-EPOCH:version-
+                  release' — not as a leading 'EPOCH:name-...' prefix — so
+                  a regex anchored on '-X-Y$' with a [^-:] character class
+                  (as this used to be) fails to match at all whenever the
+                  version segment contains a ':', leaving the epoch and
+                  version glued onto what should have been just the name
+                  (e.g. wrongly yielding 'NetworkManager-1'). rsplit avoids
+                  that: it always peels off exactly the last two dash-
+                  separated segments (version, release) regardless of what
+                  characters they contain, which also correctly preserves
+                  multi-dash names like 'libssh-config'.
+                  """
                   name = ARCH_SUFFIX_RE.sub("", nevra)
-                  name = VER_REL_RE.sub("", name)
-                  name = re.sub(r"^\d+:", "", name)
-                  return name.split(":")[0]
+                  parts = name.rsplit("-", 2)
+                  return parts[0] if len(parts) == 3 else name
 
               def parse_check_update(text):
                   SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Loading mirror", "Security:", "Added Packages")
@@ -322,7 +356,7 @@
                       parts = line.split()
                       if len(parts) < 2:
                           continue
-                      name = strip_nevra(parts[0])
+                      name = strip_arch(parts[0])
                       if not name or re.match(r"^\d", name):
                           continue
                       pkgs.append(name)
@@ -357,39 +391,73 @@
                       result.setdefault(block["Name"], block)
                   return result
 
-              def parse_updateinfo_cves(text):
-                  cve_map, cves, pkgs, in_pkgs = {}, [], [], False
-                  BLOCK_SEP_RE = re.compile(r"^(={3,}|(Name|Update\s*ID)\s*:)", re.I)
-                  CVE_FIELD_RE = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
-                  CVE_BARE_RE  = re.compile(r"^(CVE-\d{4}-\d+)", re.I)
-                  PKG_HDR_RE   = re.compile(r"^(Updated|Affected|Fixed)\s+[Pp]ackages\s*:", re.I)
-                  FIELD_RE     = re.compile(r"^\w[\w\s]+\s*:")
-                  def flush():
-                      if cves and pkgs:
-                          for p in pkgs:
-                              n = strip_nevra(p)
-                              if n:
-                                  cve_map.setdefault(n, set()).update(cves)
-                  for raw in text.splitlines():
+              def parse_advisory_id_to_packages(list_text):
+                  """
+                  Builds {advisory_id: {package_name, ...}} from
+                  `updateinfo list security` output, e.g.:
+                      ALSA-2026:28911 Moderate/Sec.  coreutils-8.32-41.el9_8.x86_64
+                  This is the exact same source security_pkgs is built
+                  from (confirmed correct — it's what produces the package
+                  list that matches `dnf updateinfo list security` 1:1),
+                  so CVEs are joined to packages through the advisory ID
+                  rather than also having to parse a separate "Updated
+                  Packages:" section out of `info` output — whose precise
+                  heading text/formatting is the fragile part that was
+                  silently failing to extract anything.
+                  """
+                  mapping = {}
+                  for raw in list_text.splitlines():
+                      parts = raw.split()
+                      if len(parts) < 3:
+                          continue
+                      advisory_id, nevra = parts[0], parts[-1]
+                      name = strip_nevra(nevra)
+                      if name:
+                          mapping.setdefault(advisory_id, set()).add(name)
+                  return mapping
+
+              def parse_advisory_cves(info_text):
+                  """
+                  Builds {advisory_id: {cve, ...}} from `updateinfo info
+                  security` output. Classic dnf/yum wrap a CVEs: field with
+                  more than one CVE onto continuation lines that repeat
+                  only a bare ':' at the same indent, e.g.:
+                      CVEs: CVE-2026-4046
+                          : CVE-2026-4437
+                          : CVE-2026-4438
+                  Those continuation lines don't start with "CVEs" or
+                  "CVE-", so they need their own branch or every CVE past
+                  the first one on a wrapped advisory is silently dropped.
+                  """
+                  ADVISORY_ID_RE = re.compile(r"^Update\s*ID\s*:\s*(\S+)", re.I)
+                  CVE_FIELD_RE   = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
+                  CVE_CONT_RE    = re.compile(r"^:\s*(.*)")
+                  result, cur_id, in_cves = {}, None, False
+                  for raw in info_text.splitlines():
                       line = raw.strip()
                       if not line:
                           continue
-                      if BLOCK_SEP_RE.match(line):
-                          flush(); cves, pkgs, in_pkgs = [], [], False
+                      m = ADVISORY_ID_RE.match(line)
+                      if m:
+                          cur_id = m.group(1)
+                          in_cves = False
                           continue
                       m = CVE_FIELD_RE.match(line)
                       if m:
-                          cves += re.findall(r"CVE-\d{4}-\d+", m.group(1)); continue
-                      if not in_pkgs and CVE_BARE_RE.match(line):
-                          cves += re.findall(r"CVE-\d{4}-\d+", line); continue
-                      if PKG_HDR_RE.match(line):
-                          in_pkgs = True; continue
-                      if FIELD_RE.match(line) and not CVE_FIELD_RE.match(line):
-                          in_pkgs = False; continue
-                      if in_pkgs and line:
-                          pkgs.append(line)
-                  flush()
-                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
+                          found = re.findall(r"CVE-\d{4}-\d+", m.group(1))
+                          if cur_id and found:
+                              result.setdefault(cur_id, set()).update(found)
+                          in_cves = True
+                          continue
+                      if in_cves:
+                          m2 = CVE_CONT_RE.match(line)
+                          if m2:
+                              found = re.findall(r"CVE-\d{4}-\d+", m2.group(1))
+                              if cur_id and found:
+                                  result.setdefault(cur_id, set()).update(found)
+                              continue
+                          in_cves = False
+                  return result
 
               def parse_dnf5_updateinfo_json(raw_json):
                   """
@@ -467,9 +535,16 @@
                   # CVE lookup: dnf5's `updateinfo info` text layout uses a
                   # References block instead of classic dnf/yum's "CVEs:"
                   # line, so it gets its own JSON-based path (dnf5 ships a
-                  # first-class --json mode for exactly this data). Classic
-                  # dnf/yum keep the original text parser, which matches
-                  # their actual field format.
+                  # first-class --json mode for exactly this data).
+                  #
+                  # Classic dnf/yum: join CVEs to packages through the
+                  # advisory ID instead of parsing a package-list section
+                  # out of `info` output. seclist_out (already fetched
+                  # above, and confirmed to match `updateinfo list
+                  # security` 1:1) already gives us {advisory_id ->
+                  # packages} reliably; parse_advisory_cves only needs to
+                  # extract {advisory_id -> CVEs} from `info`, which is a
+                  # much narrower, less format-sensitive task.
                   cve_map = {}
                   if not skip_updateinfo:
                       if is_dnf5:
@@ -481,7 +556,13 @@
                               cve_map = parse_dnf5_updateinfo_json(secinfo_json)
                       else:
                           _, secinfo_out, _ = run([mgr, "-q", "updateinfo", "info", "security", "--available"], timeout=180)
-                          cve_map = parse_updateinfo_cves(secinfo_out)
+                          advisory_cves = parse_advisory_cves(secinfo_out)
+                          advisory_pkgs = parse_advisory_id_to_packages(seclist_out)
+                          pkg_cves = {}
+                          for adv_id, cves in advisory_cves.items():
+                              for pkg_name in advisory_pkgs.get(adv_id, ()):
+                                  pkg_cves.setdefault(pkg_name, set()).update(cves)
+                          cve_map = {k: ",".join(sorted(v)) for k, v in pkg_cves.items()}
 
                   def _fmt_version(info):
                       ver, rel = info.get("Version", ""), info.get("Release", "")
