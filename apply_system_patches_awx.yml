@@ -84,8 +84,40 @@
 #     single job that had at least one failed package, cluttering AWX
 #     job output with a confusing red (ignored) failure. Its output was
 #     immediately overwritten by the very next task anyway, which
-#     already builds install_error correctly via a simple loop. See
-#     FIX NOTE 12 inline below for exactly what was removed.
+#     already builds install_error correctly via a simple loop.
+# 13. Install mode. 'transaction_then_fallback' (default) installs
+#     every selected OS package together in one atomic transaction
+#     first (correct for interdependent sets like systemd/systemd-libs/
+#     systemd-pam or glibc/glibc-common/glibc-langpack), and only drops
+#     to the old one-package-at-a-time loop if that transaction fails,
+#     purely to isolate which package caused it. Set to
+#     'per_package_only' via survey/extra_vars to skip the transaction
+#     attempt entirely and always install one at a time.
+# 14. Manual classification overrides. Metadata-based classification is
+#     good but not infallible (OEM kernels, cloud agents, vendor
+#     networking tools, third-party repos can all break the usual
+#     conventions). os_classification_force_include /
+#     os_classification_force_exclude let an operator correct specific
+#     packages via survey/extra_vars without touching the scanner.
+# 15. (reserved)
+# 16. ansible_date_time was gathered once, at the start of this host's
+#     run. On a host where the scan+apply took a while, reusing that
+#     stale timestamp for the report would misreport when patching
+#     actually finished. A fresh timestamp is fetched from the target
+#     right before building the report instead.
+# 17. A single multi-package apt/dnf/yum call only reports one
+#     aggregate `changed` for the whole transaction, not per package.
+#     To report per-package changed status honestly on the
+#     transaction-success path, each package's pre-install version
+#     (from the scan) is compared against its actual post-install
+#     version queried straight from the package database.
+# 18. (review round 3) PATCH EXECUTION SUMMARY output — both the
+#     per-host and fleet-wide debug summaries are now numbered,
+#     dynamically labeled by mode (SCAN ONLY vs APPLY PATCHES), and
+#     free of the old ambiguous "Total OS packages patched fleet-wide"
+#     field. In scan mode the fleet total is now explicitly labeled
+#     "OS Packages Identified"; in apply mode it is labeled
+#     "OS Packages Installed" — the two are never confusable again.
 #
 # AWX SURVEY (recommended fields -- exact JSON spec at the bottom of
 # this file): target_hosts (text), dry_run (boolean, default true),
@@ -148,23 +180,7 @@
     # see FIX NOTE 1 above. They are resolved into effective_dry_run /
     # effective_reboot_if_required by the first task below, and the
     # Survey remains the single source of truth for both.
-    #
-    # FIX NOTE 13 -- install mode. 'transaction_then_fallback' (default)
-    # installs every selected OS package together in one atomic
-    # transaction first (correct for interdependent sets like
-    # systemd/systemd-libs/systemd-pam or glibc/glibc-common/
-    # glibc-langpack), and only drops to the old one-package-at-a-time
-    # loop if that transaction fails, purely to isolate which package
-    # caused it. Set to 'per_package_only' via survey/extra_vars to skip
-    # the transaction attempt entirely and always install one at a time.
     os_patch_install_mode: "transaction_then_fallback"
-    # FIX NOTE 14 -- manual classification overrides. Metadata-based
-    # classification is good but not infallible (OEM kernels, cloud
-    # agents, vendor networking tools, third-party repos can all break
-    # the usual conventions). These two optional lists let an operator
-    # correct specific packages via survey/extra_vars without touching
-    # the scanner: names here always win over whatever the scanner
-    # decided, for this run only.
     os_classification_force_include: []   # package names to always treat as OS, regardless of scanner result
     os_classification_force_exclude: []   # package names to always exclude from OS, regardless of scanner result
 
@@ -1286,20 +1302,13 @@
             # ─────────────────────────────────────────────────────────
             # FIX NOTE 12 -- removed the old "Collect per-package
             # failure summaries" task that used to sit here. It built
-            # install_error via:
-            #
-            #   ... | map('extract_name_error') | default([]) | list ...
-            #
-            # `extract_name_error` is not a real Jinja/Ansible filter,
-            # so this task threw an (ignored) error on every single run
-            # that had at least one failed package -- and its own inline
-            # comment admitted the result was thrown away anyway,
-            # because the two tasks below (which already worked
-            # correctly) immediately overwrote install_error with the
-            # real value. Deleting it changes nothing about the
-            # playbook's behavior; it only removes a confusing,
-            # permanently-broken, ignore_errors-masked task from every
-            # AWX job log.
+            # install_error via a non-existent Jinja filter
+            # (`extract_name_error`), threw an (ignored) error on every
+            # run with a failed package, and its output was immediately
+            # overwritten anyway by the two tasks below, which already
+            # build install_error correctly. Deleting it changes nothing
+            # about behavior; it only removes a permanently-broken,
+            # ignore_errors-masked task from every AWX job log.
             # ─────────────────────────────────────────────────────────
 
             - name: Initialize failed-package summary list
@@ -1474,18 +1483,35 @@
       set_fact:
         os_patch_details: "{{ os_patch_details_enriched }}"
 
-    - name: "Operating system patch summary: {{ inventory_hostname }}"
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 18 -- PATCH EXECUTION SUMMARY (per host). Numbered,
+    # human-readable, and dynamically labeled by mode:
+    #   - Execution Mode auto-switches between "SCAN ONLY" and
+    #     "APPLY PATCHES" based on effective_dry_run.
+    #   - "OS Packages Installed" is only ever a real install count
+    #     (0 in scan mode, by definition — nothing was installed).
+    #   - Reboot Required / Install Error / low-confidence classification
+    #     are always shown so operators don't have to dig into the raw
+    #     JSON for a fleet-wide audit.
+    # ───────────────────────────────────────────────────────────────────
+    - name: "Patch execution summary: {{ inventory_hostname }}"
       debug:
         msg:
-          - "=========== OPERATING-SYSTEM-ONLY PATCH: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}) ==========="
-          - "Mode                : {{ 'DRY RUN (nothing changed)' if effective_dry_run else 'APPLIED' }}"
-          - "Total OS patches    : {{ os_patch_details | length }}"
-          - "Pending, left untouched (security/application): {{ (all_patches | length) - (os_packages | length) }}"
-          - "Changed             : {{ any_changed }}"
-          - "Reboot required     : {{ reboot_required }}"
-          - "Install error       : {{ install_error if install_error else '(none)' }}"
-          - "Low-confidence class.: {{ low_confidence_os_packages | default([]) | length }} (fallback name-match, not metadata — review recommended)"
-          - "======================================================================"
+          - "============================================================"
+          - "                 PATCH EXECUTION SUMMARY"
+          - "============================================================"
+          - ""
+          - "Host                    : {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
+          - "Execution Mode          : {{ 'SCAN ONLY' if effective_dry_run else 'APPLY PATCHES' }}"
+          - ""
+          - "1. OS Packages Found         : {{ os_patch_details | length }}"
+          - "2. OS Packages Installed     : {{ (os_patch_details | selectattr('status', 'equalto', 'success') | list | length) if not effective_dry_run else 0 }}"
+          - "3. Installation Status       : {{ 'NOT APPLIED (Scan Only)' if effective_dry_run else ('SUCCESS' if not install_error else 'PARTIAL / FAILED') }}"
+          - "4. Reboot Required           : {{ 'YES' if reboot_required else 'NO' }}"
+          - "5. Install Error             : {{ install_error if install_error else '(none)' }}"
+          - "6. Pending, Left Untouched   : {{ (all_patches | length) - (os_packages | length) }} (security/application packages)"
+          - "7. Low-Confidence Class.     : {{ low_confidence_os_packages | default([]) | length }} (fallback name-match, review recommended)"
+          - "============================================================"
 
     - name: "Operating system patches — {{ inventory_hostname }} ({{ os_patch_details | length }} total)"
       debug:
@@ -1565,20 +1591,42 @@
       delegate_to: localhost
       set_fact:
         fleet_os_totals:
+          hosts_processed: "{{ ansible_play_hosts | length }}"
           hosts_patched: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.changed', 'equalto', true) | list | length }}"
+          hosts_failed: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.install_error', 'ne', '') | list | length }}"
           hosts_reboot_required: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.reboot_required', 'equalto', true) | list | length }}"
           total_os_packages: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact.os_patched') | map('length') | sum }}"
 
-    - name: "Fleet-wide operating system patch totals"
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 18 (cont.) -- FLEET SUMMARY. Numbered, human-readable, and
+    # the field that used to read "Total OS packages patched fleet-wide"
+    # (ambiguous in scan mode, where nothing is actually "patched") is
+    # now dynamically relabeled:
+    #   - Scan mode  -> "OS Packages Identified"
+    #   - Apply mode -> "OS Packages Installed"
+    # Both use the same underlying total_os_packages count; only the
+    # label changes, so scan-mode output can never be misread as "these
+    # were installed".
+    # ───────────────────────────────────────────────────────────────────
+    - name: "Fleet-wide patch execution summary"
       run_once: true
       delegate_to: localhost
       debug:
         msg:
-          - "=========== FLEET OS PATCH TOTALS ({{ ansible_play_hosts | length }} host(s)) ==========="
-          - "Hosts with changes  : {{ fleet_os_totals.hosts_patched }}"
-          - "Hosts needing reboot: {{ fleet_os_totals.hosts_reboot_required }}"
-          - "Total OS packages patched fleet-wide: {{ fleet_os_totals.total_os_packages }}"
-          - "======================================================================"
+          - "============================================================"
+          - "                    FLEET SUMMARY"
+          - "============================================================"
+          - ""
+          - "Execution Mode          : {{ 'SCAN ONLY' if (dry_run | default(true) | bool) else 'APPLY PATCHES' }}"
+          - ""
+          - "1. Hosts Processed           : {{ fleet_os_totals.hosts_processed }}"
+          - "2. Hosts Patched             : {{ fleet_os_totals.hosts_patched }}"
+          - "3. Hosts Failed              : {{ fleet_os_totals.hosts_failed }}"
+          - "4. Hosts Needing Reboot      : {{ fleet_os_totals.hosts_reboot_required }}"
+          - "5. {{ 'OS Packages Identified' if (dry_run | default(true) | bool) else 'OS Packages Installed' }}   : {{ fleet_os_totals.total_os_packages }}"
+          - ""
+          - "Overall Result           : {{ 'SCAN COMPLETE' if (dry_run | default(true) | bool) else ('SUCCESS' if fleet_os_totals.hosts_failed == '0' else 'COMPLETED WITH ERRORS') }}"
+          - "============================================================"
 
     - name: Publish aggregated report (single job-level artifact)
       run_once: true
