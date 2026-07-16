@@ -1667,10 +1667,21 @@
           }}
       vars:
         pkg: "{{ item.1 }}"
-      loop: "{{ query('subelements', hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact') | list, 'os_patched', {'skip_missing': True}) }}"
+      # NOTE: the loop source itself resolves to an empty list when the
+      # feature flag is off, rather than gating a populated loop with a
+      # task-level `when`. Ansible evaluates `loop:` BEFORE `when` is
+      # checked per item, so a populated loop + a false `when` still
+      # prints one "skipping" line per item (here, one per package across
+      # the whole fleet) even though nothing ever runs. Emptying the loop
+      # source avoids that noise entirely -- zero items means zero lines.
+      loop: >-
+        {{
+          query('subelements', hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact') | list, 'os_patched', {'skip_missing': True})
+          if (show_fleet_package_list | default(false) | bool)
+          else []
+        }}
       loop_control:
         label: "{{ item.0.name | default('unknown') }}"
-      when: show_fleet_package_list | default(false) | bool
 
     - name: Number the fleet-wide package display list
       run_once: true
