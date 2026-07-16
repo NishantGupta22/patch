@@ -1513,14 +1513,15 @@
           - "7. Low-Confidence Class.     : {{ low_confidence_os_packages | default([]) | length }} (fallback name-match, review recommended)"
           - "============================================================"
 
-    - name: "Operating system patches — {{ inventory_hostname }} ({{ os_patch_details | length }} total)"
+    - name: "{{ 'Available OS Patches' if effective_dry_run else 'Installed OS Patches' }} — {{ inventory_hostname }} ({{ os_patch_details | length }} total)"
       debug:
         msg: >-
-          {{ '%-9s' | format(item.status | default('unknown')) }}
+          {{ '%3d' | format(idx + 1) }}. [{{ '%-9s' | format(item.status | default('unknown')) }}]
           {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
-          [{{ item.classification }}]{{ (' ERROR: ' ~ item.error) if (item.error | default('')) else '' }}
+          ({{ item.classification }}){{ (' — ERROR: ' ~ item.error) if (item.error | default('')) else '' }}
       loop: "{{ os_patch_details }}"
       loop_control:
+        index_var: idx
         label: "{{ item.name }}"
       when: (os_patch_details | length) > 0
 
@@ -1591,6 +1592,16 @@
       delegate_to: localhost
       set_fact:
         fleet_os_totals:
+          # FIX NOTE 19 -- fleet_dry_run is read from the per-host fact
+          # (os_apply_report_fact.dry_run) that each host already
+          # computed from the Survey via effective_dry_run, NOT by
+          # re-reading the raw dry_run extra_var a second time here.
+          # This makes the per-host facts the single source of truth
+          # end-to-end: whatever each host actually did (scan-only or
+          # apply) is exactly what the fleet summary reports, with no
+          # chance of it disagreeing due to a stray Job Template
+          # default colliding with the Survey answer.
+          fleet_dry_run: "{{ (hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact.dry_run') | list | first) | default(true) | bool }}"
           hosts_processed: "{{ ansible_play_hosts | length }}"
           hosts_patched: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.changed', 'equalto', true) | list | length }}"
           hosts_failed: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.install_error', 'ne', '') | list | length }}"
@@ -1598,15 +1609,48 @@
           total_os_packages: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact.os_patched') | map('length') | sum }}"
 
     # ───────────────────────────────────────────────────────────────────
-    # FIX NOTE 18 (cont.) -- FLEET SUMMARY. Numbered, human-readable, and
-    # the field that used to read "Total OS packages patched fleet-wide"
-    # (ambiguous in scan mode, where nothing is actually "patched") is
-    # now dynamically relabeled:
+    # FIX NOTE 19 (cont.) -- flatten every host's os_patched list into a
+    # single "host | status  package: old -> new" line, fleet-wide, so
+    # the actual patch names are visible directly under the summary
+    # instead of only in the earlier per-host per-package debug task.
+    # Uses the `subelements` lookup to walk host -> os_patched pairs in
+    # one pass, rather than manual index math.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Build simple fleet-wide package display list (one line per package, per host)
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        fleet_display_lines: >-
+          {{
+            fleet_display_lines | default([]) +
+            [ item.0.hostname ~ ' | ' ~ (pkg.status | default('pending')) ~ '  ' ~ pkg.name ~ ': ' ~ pkg.current_version ~ ' -> ' ~ pkg.new_version ]
+          }}
+      vars:
+        pkg: "{{ item.1 }}"
+      loop: "{{ query('subelements', hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact') | list, 'os_patched', {'skip_missing': True}) }}"
+      loop_control:
+        label: "{{ item.0.name | default('unknown') }}"
+
+    - name: Number the fleet-wide package display list
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        fleet_numbered_lines: >-
+          {{
+            range(1, (fleet_display_lines | default([]) | length) + 1) | list
+            | zip(fleet_display_lines | default([]))
+            | map('list') | list
+          }}
+
+    # ───────────────────────────────────────────────────────────────────
+    # FLEET SUMMARY. Numbered, human-readable, and the field that used
+    # to read "Total OS packages patched fleet-wide" (ambiguous in scan
+    # mode, where nothing is actually "patched") is dynamically
+    # relabeled:
     #   - Scan mode  -> "OS Packages Identified"
     #   - Apply mode -> "OS Packages Installed"
-    # Both use the same underlying total_os_packages count; only the
-    # label changes, so scan-mode output can never be misread as "these
-    # were installed".
+    # Execution Mode is read from fleet_os_totals.fleet_dry_run (per-host
+    # fact), not from the raw dry_run var — see FIX NOTE 19 above.
     # ───────────────────────────────────────────────────────────────────
     - name: "Fleet-wide patch execution summary"
       run_once: true
@@ -1617,16 +1661,26 @@
           - "                    FLEET SUMMARY"
           - "============================================================"
           - ""
-          - "Execution Mode          : {{ 'SCAN ONLY' if (dry_run | default(true) | bool) else 'APPLY PATCHES' }}"
+          - "Execution Mode          : {{ 'SCAN ONLY' if fleet_os_totals.fleet_dry_run else 'APPLY PATCHES' }}"
           - ""
           - "1. Hosts Processed           : {{ fleet_os_totals.hosts_processed }}"
           - "2. Hosts Patched             : {{ fleet_os_totals.hosts_patched }}"
           - "3. Hosts Failed              : {{ fleet_os_totals.hosts_failed }}"
           - "4. Hosts Needing Reboot      : {{ fleet_os_totals.hosts_reboot_required }}"
-          - "5. {{ 'OS Packages Identified' if (dry_run | default(true) | bool) else 'OS Packages Installed' }}   : {{ fleet_os_totals.total_os_packages }}"
+          - "5. {{ 'OS Packages Identified' if fleet_os_totals.fleet_dry_run else 'OS Packages Installed' }}   : {{ fleet_os_totals.total_os_packages }}"
           - ""
-          - "Overall Result           : {{ 'SCAN COMPLETE' if (dry_run | default(true) | bool) else ('SUCCESS' if fleet_os_totals.hosts_failed == '0' else 'COMPLETED WITH ERRORS') }}"
+          - "Overall Result           : {{ 'SCAN COMPLETE' if fleet_os_totals.fleet_dry_run else ('SUCCESS' if fleet_os_totals.hosts_failed == '0' else 'COMPLETED WITH ERRORS') }}"
           - "============================================================"
+
+    - name: "{{ 'Available OS Patches' if fleet_os_totals.fleet_dry_run else 'Installed OS Patches' }} (fleet-wide, numbered)"
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg: "{{ '%3d' | format(item.0) }}. {{ item.1 }}"
+      loop: "{{ fleet_numbered_lines }}"
+      loop_control:
+        label: "package {{ item.0 }}"
+      when: (fleet_display_lines | default([]) | length) > 0
 
     - name: Publish aggregated report (single job-level artifact)
       run_once: true
