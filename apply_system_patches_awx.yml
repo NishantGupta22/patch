@@ -124,14 +124,14 @@
 #     independent read of the raw dry_run extra_var at the aggregation
 #     play -- the per-host facts stay the single source of truth
 #     end-to-end.
-# 20. (review round 4) The fleet-wide numbered package list and the
-#     per-host numbered package list are BOTH off by default now
-#     (show_fleet_package_list / show_per_host_package_list, both
-#     default false) -- normal runs only print the two short summary
-#     blocks (per-host PATCH EXECUTION SUMMARY + fleet-wide FLEET
-#     SUMMARY), not the full package-by-package listing, so the AWX
-#     job log stays short. Set either var to true via survey/extra_vars
-#     when you actually want the full per-package breakdown.
+# 20. (review round 4) The per-host package listing is always shown now
+#     (name / current / new — one short block per package), matching
+#     the always-on style apply_security_patches_awx.yml already uses.
+#     The fleet-wide numbered package list (a second, duplicate listing
+#     of every package again at the very end of the job) stays off by
+#     default (show_fleet_package_list, default false) so that list
+#     specifically doesn't triple up the job log -- set it to true via
+#     survey/extra_vars if you want that fleet-wide roll-up as well.
 # 21. (review round 4) Fleet-wide Overall Result now distinguishes three
 #     outcomes in apply mode instead of one generic "SUCCESS": PATCHED
 #     APPLIED (ran clean, at least one host actually changed), NO
@@ -1544,26 +1544,20 @@
     # (task "Available/Installed OS Patches (fleet-wide, numbered)" at
     # the end of the aggregation play) is also disabled by default now,
     # so a normal run only ever shows the two short summary blocks
-    # (this one + the fleet-wide FLEET SUMMARY), not a 30-40 line
-    # package-by-package dump. Set show_per_host_package_list: true via
-    # survey/extra_vars if you specifically want the per-host breakdown
-    # as well (e.g. when running against many hosts and you want to jump
-    # straight to one host's section without scrolling to the fleet
-    # summary at the bottom).
+    # (matches the always-on per-package listing style used by
+    # apply_security_patches_awx.yml — one short block per package,
+    # name / current / new, no flag needed to see it).
     # ───────────────────────────────────────────────────────────────────
     - name: "{{ 'Available OS Patches' if effective_dry_run else 'Installed OS Patches' }} — {{ inventory_hostname }} ({{ os_patch_details | length }} total)"
       debug:
-        msg: >-
-          {{ '%3d' | format(idx + 1) }}. [{{ '%-9s' | format(item.status | default('unknown')) }}]
-          {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
-          ({{ item.classification }}){{ (' — ERROR: ' ~ item.error) if (item.error | default('')) else '' }}
+        msg:
+          - "name: {{ item.name }}"
+          - "current : {{ item.current_version }}"
+          - "new: {{ item.new_version }}{{ ' — ERROR: ' ~ item.error if (item.error | default('')) else '' }}"
       loop: "{{ os_patch_details }}"
       loop_control:
-        index_var: idx
         label: "{{ item.name }}"
-      when:
-        - (os_patch_details | length) > 0
-        - show_per_host_package_list | default(false) | bool
+      when: (os_patch_details | length) > 0
 
     - name: Store operating system patch report as a plain host fact (for aggregation)
       set_fact:
@@ -1800,15 +1794,6 @@
 #       "type": "integer",
 #       "required": false,
 #       "default": 1800
-#     },
-#     {
-#       "question_name": "Show per-host package list?",
-#       "question_description": "true = also print the full per-host package-by-package listing (verbose). false = short summary only.",
-#       "variable": "show_per_host_package_list",
-#       "type": "multiplechoice",
-#       "choices": "true\nfalse",
-#       "required": false,
-#       "default": "false"
 #     },
 #     {
 #       "question_name": "Show fleet-wide package list?",
