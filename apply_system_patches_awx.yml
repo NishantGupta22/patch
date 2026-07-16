@@ -916,13 +916,14 @@
                 - effective_dry_run
                 - (os_packages | length) > 0
 
-            - name: "[Debian] Show dry-run simulate output"
+            - name: "[Debian] Show dry-run simulate output (raw apt-get -s — verbose/debug only)"
               debug:
                 var: apt_dryrun_preview.stdout_lines
               when:
                 - ansible_os_family == "Debian"
                 - effective_dry_run
                 - (os_packages | length) > 0
+                - show_raw_dryrun_preview | default(false) | bool
 
             # ---- Debian real apply: single transaction (primary path) ----
             - name: "[Debian] Install all selected OS updates in a single transaction"
@@ -993,13 +994,14 @@
                 - effective_dry_run
                 - (os_packages | length) > 0
 
-            - name: "[RedHat] Show dry-run simulate output"
+            - name: "[RedHat] Show dry-run simulate output (raw dnf/yum --assumeno — verbose/debug only)"
               debug:
                 var: (dnf_dryrun_preview.stdout_lines if (dnf_dryrun_preview is defined and not (dnf_dryrun_preview.skipped | default(false))) else yum_dryrun_preview.stdout_lines)
               when:
                 - ansible_os_family == "RedHat"
                 - effective_dry_run
                 - (os_packages | length) > 0
+                - show_raw_dryrun_preview | default(false) | bool
 
             # ---- RHEL family real apply: single transaction (primary path) ----
             - name: "[RedHat - dnf5] Install all selected OS updates in a single transaction"
@@ -1513,6 +1515,21 @@
           - "7. Low-Confidence Class.     : {{ low_confidence_os_packages | default([]) | length }} (fallback name-match, review recommended)"
           - "============================================================"
 
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 20 -- disabled by default. The fleet-wide numbered list
+    # (task "Available/Installed OS Patches (fleet-wide, numbered)" at
+    # the end of the aggregation play) already shows every package for
+    # every host, one clean line each, and is the single canonical
+    # place to see "what patches are available/were installed". Printing
+    # the same list again here per-host caused the same 38 packages to
+    # appear 2-3 times in the AWX job log (once here, once in the raw
+    # dry-run simulate output, once in the fleet roll-up), which is
+    # confusing rather than helpful. Set show_per_host_package_list: true
+    # via survey/extra_vars if you specifically want the per-host
+    # breakdown as well (e.g. when running against many hosts and you
+    # want to jump straight to one host's section without scrolling to
+    # the fleet summary at the bottom).
+    # ───────────────────────────────────────────────────────────────────
     - name: "{{ 'Available OS Patches' if effective_dry_run else 'Installed OS Patches' }} — {{ inventory_hostname }} ({{ os_patch_details | length }} total)"
       debug:
         msg: >-
@@ -1523,7 +1540,9 @@
       loop_control:
         index_var: idx
         label: "{{ item.name }}"
-      when: (os_patch_details | length) > 0
+      when:
+        - (os_patch_details | length) > 0
+        - show_per_host_package_list | default(false) | bool
 
     - name: Store operating system patch report as a plain host fact (for aggregation)
       set_fact:
