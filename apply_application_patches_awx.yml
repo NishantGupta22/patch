@@ -1063,28 +1063,50 @@
               failed_when: false
               when: ansible_os_family == "RedHat"
 
-            - name: Compute batches with collateral floor-package impact and filter matched_packages
+            # NOTE: 'intersect' is a Jinja2 FILTER (list1 | intersect(list2)),
+            # not a TEST — it cannot be passed as the test name to
+            # selectattr()/rejectattr(). An earlier revision of this task did
+            # exactly that (selectattr('stdout_lines', 'intersect', ...)) and
+            # fails on every host with an opaque "line 0" template error,
+            # since Ansible can't resolve a test named 'intersect'. This
+            # version applies the intersect filter directly, per batch, via
+            # an accumulating loop instead.
+            - name: Collect simulated-install results that have output to check
               set_fact:
-                dependency_conflict_packages: >-
+                dep_sim_all: >-
                   {{
                     (dep_sim_deb.results | default([]) + dep_sim_rh.results | default([]))
                     | selectattr('stdout_lines', 'defined')
-                    | map(attribute='stdout_lines')
-                    | list
-                    | flatten
-                    | select('in', floor_reference_set | default([]))
-                    | unique
+                    | selectattr('install_batch', 'defined')
                     | list
                   }}
+
+            - name: Initialize floor-conflict accumulators
+              set_fact:
+                floor_conflict_batches: []
+                dependency_conflict_packages: []
+
+            - name: Flag batches whose simulated install would also touch a floored OS package
+              set_fact:
+                floor_conflict_batches: "{{ floor_conflict_batches + [dep_sim_item.install_batch] }}"
+                dependency_conflict_packages: >-
+                  {{
+                    (dependency_conflict_packages
+                     + (dep_sim_item.stdout_lines | intersect(floor_reference_set | default([]))))
+                    | unique | list
+                  }}
+              loop: "{{ dep_sim_all }}"
+              loop_control:
+                loop_var: dep_sim_item
+                label: "batch of {{ dep_sim_item.install_batch | length }}"
+              when: (dep_sim_item.stdout_lines | intersect(floor_reference_set | default([])) | length) > 0
+
+            - name: Filter matched_packages to drop any batch with a collateral floor-package conflict
+              set_fact:
                 matched_packages: >-
                   {{
                     matched_packages
-                    | reject('in',
-                        ((dep_sim_deb.results | default([]) + dep_sim_rh.results | default([]))
-                         | selectattr('stdout_lines', 'defined')
-                         | selectattr('stdout_lines', 'intersect', floor_reference_set | default([]))
-                         | map(attribute='install_batch')
-                         | list | flatten))
+                    | reject('in', (floor_conflict_batches | default([]) | flatten))
                     | list
                   }}
 
