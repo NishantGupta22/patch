@@ -1,5 +1,5 @@
 ---
-# apply_application_patches_smart.yml
+# apply_application_patches_smart.yml  (v2)
 #
 # Self-contained AWX job: scans a host for pending package updates and
 # classifies each one as "application" or "os" using a LAYERED,
@@ -8,52 +8,84 @@
 # completely untouched by this playbook (patch them with your OS
 # playbook / security playbook instead).
 #
+# v2 CHANGELOG (production review fixes)
+# ---------------------------------------------------------------------
+#  - AppStream is no longer part of the RHEL OS floor. Only BaseOS (and
+#    equivalents) is a hard floor now; AppStream/extras/plus/devel/etc.
+#    are "official but continue" — they still get a chance to match the
+#    curated application pattern before falling back to OS.
+#  - EPEL is no longer treated as an official repo. It now behaves like
+#    any other third-party repo (Layer 3), so EPEL-sourced packages
+#    classify as application unless curated/forced otherwise.
+#  - Curated pattern list expanded with common DevOps/infra tooling
+#    (ansible, helm, istio, traefik, git*, cloud CLIs, config-mgmt
+#    tools, harbor/sonarqube/nexus/artifactory, minikube/kind, etc.)
+#  - New trust tier: trusted_internal_repo_hosts / _patterns for
+#    internal mirrors (Artifactory/Nexus/apt.company.local/etc.) — these
+#    get "official but continue" treatment like AppStream, not an
+#    automatic OS-or-application verdict.
+#  - Debian classification prefers python3-apt (if importable and the
+#    apt cache opens cleanly) for essential/priority/origin data, with
+#    automatic fallback to apt-cache text parsing if it isn't available.
+#  - Package installs are batched (package_install_batch_size, default
+#    50) instead of one giant name list, to avoid rare shell/arg-length
+#    limits on hosts with very large application package sets.
+#  - needs-restarting existence is checked with `command -v` before
+#    being invoked, for minimal images where dnf-utils install failed.
+#  - The classifier no longer swallows exceptions silently — scan_error
+#    is populated with the real exception text and surfaced in the AWX
+#    report.
+#  - Every package record now reports: package_manager, repository,
+#    repository_type, classification_layer, reason, scan_time — in
+#    addition to classification/current_version/new_version.
+#
 # WHY LAYERED, NOT A SINGLE RULE
 # ---------------------------------------------------------------------
 # Ubuntu, Kali, AlmaLinux, and CentOS/RHEL-family do not publish an
 # official "Type=Application" field anywhere in package metadata. A
 # single deterministic rule cannot separate application software from
-# OS infrastructure with high accuracy — see classification notes below
-# for the concrete Apache-vs-systemd counterexample. Instead this
-# playbook stacks four layers, each authoritative for the cases it
-# covers, falling through to the next layer only when the previous one
-# has no opinion:
+# OS infrastructure with high accuracy. This playbook stacks five
+# layers, each authoritative for the cases it covers, falling through
+# to the next layer only when the previous one has no opinion:
 #
-#   Layer 1 — FORCE lists (force_exclude / force_application_packages /
-#             force_application_patterns): explicit human judgement.
-#             Always wins, in that order.
+#   Layer 1 — FORCE lists: force_exclude beats force_application_packages
+#             beats force_application_patterns. Explicit human judgement,
+#             always wins over every other layer.
 #   Layer 2 — OS FLOOR (deterministic, metadata-only): Essential=yes or
 #             Priority in {required, important} on Debian; repo name
-#             matches an official BaseOS/base/updates/extras pattern on
-#             RHEL-family. These are NEVER eligible, even if they also
-#             match Layer 3 or 4.
-#   Layer 3 — REPO ORIGIN (deterministic, metadata-only): package comes
-#             from a repository that is NOT one of the OS vendor's own
-#             repos (Docker, PGDG, Grafana, Elastic, NodeSource,
-#             MongoDB, Microsoft, GitLab, Jenkins, HashiCorp, etc.).
-#             Third-party repo => application. This needs zero
-#             hardcoded package names — it works for any vendor repo.
-#   Layer 4 — CURATED APPLICATION PATTERN (policy, human-authored):
-#             covers well-known application software that ships from
-#             the distro's own official repos (nginx, apache2/httpd,
-#             mysql/mariadb, postgresql, php, redis, tomcat, ...).
-#             Doc analysis is correct that no metadata field makes this
-#             distinction automatically — that policy has to be written
-#             down somewhere, so it's written down here, in one place,
-#             and is fully override-able via extra_application_patterns
-#             / application_pattern_overrides.
+#             matches BaseOS (and equivalents) on RHEL-family. NEVER
+#             eligible, even if Layer 4/5 would also match.
+#   Layer 3 — TRUSTED-BUT-CONTINUE (deterministic, metadata-only):
+#             package comes from an official OS-vendor repo that isn't
+#             the hard floor (e.g. AppStream, updates, extras) OR from
+#             an org-defined trusted internal mirror. Doesn't decide by
+#             itself — just skips Layer 4's "third-party => application"
+#             shortcut and falls through to Layer 5.
+#   Layer 4 — REPO ORIGIN (deterministic, metadata-only): package comes
+#             from a repo that is neither the OS vendor's own repo nor a
+#             trusted internal mirror (Docker, PGDG, Grafana, Elastic,
+#             NodeSource, MongoDB, Microsoft, GitLab, Jenkins, EPEL,
+#             HashiCorp, etc.). Third-party repo => application. Needs
+#             zero hardcoded package names.
+#   Layer 5 — CURATED APPLICATION PATTERN (policy, human-authored):
+#             covers well-known application/DevOps software that ships
+#             from the distro's own official repos or a trusted internal
+#             mirror (nginx, postgresql, ansible, helm, git, aws CLIs,
+#             sonarqube, ...). No metadata field makes this distinction
+#             automatically, so it's written down here, in one place,
+#             fully override-able via extra_application_patterns /
+#             application_pattern_overrides.
 #
-# Anything that falls through all four layers is classified "os" (safe
-# default — ambiguous is never silently patched as an application) and
-# is reported separately in classification_ambiguous_left_as_os so you
-# can review it and, if appropriate, add it to
-# extra_application_patterns.
+# Anything that falls through all five layers is classified "os" (safe
+# default) and reported separately in classification_ambiguous_left_as_os
+# so you can review it and, if appropriate, extend the curated list.
 #
 # This design will not hit 100% — your own infra's third-party repos
 # and locally-built/internal packages are the main source of residual
 # misses. Point trusted_os_repo_hosts / official_repo_patterns_redhat /
+# trusted_internal_repo_hosts / trusted_internal_repo_patterns /
 # extra_application_patterns at your environment once and accuracy
-# converges quickly toward the 98% target for a given fleet.
+# converges toward the 98% target for a given fleet.
 #
 # SAFETY: if force_application_packages, force_application_patterns,
 # AND enable_repo_origin_detection (false) AND
@@ -71,18 +103,26 @@
 #   force_exclude                   list of exact package names — NEVER
 #                                    patched by this playbook, overrides
 #                                    everything else (even force_application_*)
-#   enable_repo_origin_detection    true (default) — Layer 3
-#   enable_curated_app_detection    true (default) — Layer 4
+#   enable_repo_origin_detection    true (default) — Layer 4
+#   enable_curated_app_detection    true (default) — Layer 5
 #   extra_application_patterns      list of fnmatch globs ADDED to the
-#                                    built-in curated list (Layer 4)
+#                                    built-in curated list (Layer 5)
 #   application_pattern_overrides   list of fnmatch globs that REPLACES
 #                                    the built-in curated list entirely
 #   trusted_os_repo_hosts           (Debian) extra hostnames to treat as
 #                                    "official OS repo" beyond the built-in
 #                                    list — ADDED, not replacing
 #   official_repo_patterns_redhat   extra regex fragments to treat as
-#                                    "official OS repo" on RHEL-family —
-#                                    ADDED, not replacing
+#                                    "official, continue classification"
+#                                    on RHEL-family — ADDED, not replacing
+#   trusted_internal_repo_hosts     (Debian) internal mirror hostnames
+#                                    (Artifactory/Nexus/apt.company.local)
+#                                    treated as "official, continue" —
+#                                    NOT an automatic OS verdict
+#   trusted_internal_repo_patterns  (RHEL) regex fragments for internal
+#                                    mirror reponames — same treatment
+#   package_install_batch_size      50 (default) — packages per install
+#                                    batch, avoids arg-length limits
 #   reboot_if_required              false (default)
 #   patch_serial                    '100%' (default) — Ansible `serial`
 #
@@ -101,6 +141,7 @@
     reboot_timeout: 600
     patch_scan_timeout: 900
     patch_scanner_python: "/usr/bin/python3"
+    package_install_batch_size: 50
 
     force_application_packages: []
     force_application_patterns: []
@@ -113,6 +154,8 @@
 
     trusted_os_repo_hosts: []
     official_repo_patterns_redhat: []
+    trusted_internal_repo_hosts: []
+    trusted_internal_repo_patterns: []
 
   tasks:
 
@@ -167,6 +210,15 @@
         - apt_update_result.rc is defined
         - apt_update_result.rc != 0
 
+    - name: "[Debian] Probe for python3-apt (optional fast/accurate metadata path)"
+      command: "{{ patch_scanner_python }} -c 'import apt'"
+      register: python3_apt_probe
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_os_family == "Debian"
+        - not (no_targets_given | bool)
+
     - name: "[RedHat] Refresh package metadata"
       shell: |
         set -e
@@ -183,10 +235,11 @@
         - ansible_os_family == "RedHat"
         - not (no_targets_given | bool)
 
-    - name: "[RedHat] Ensure dnf-utils/yum-utils is present (needed for repoquery)"
+    - name: "[RedHat] Ensure dnf-utils/yum-utils is present (needed for repoquery/needs-restarting)"
       package:
         name: "{{ 'dnf-utils' if (ansible_pkg_mgr in ['dnf', 'dnf5']) else 'yum-utils' }}"
         state: present
+      register: dnf_utils_install
       when:
         - ansible_os_family == "RedHat"
         - not (no_targets_given | bool)
@@ -195,8 +248,8 @@
     - name: "[RedHat] Warn (non-fatal) if metadata refresh failed"
       debug:
         msg: >-
-          makecache reported errors on {{ inventory_hostname }} — scan
-          will continue using whatever repos did refresh.
+          makecache reported errors on {{ inventory_hostname }} —
+          scan will continue using whatever repos did refresh.
           {{ (rh_makecache.stderr | default('') + ' ' + rh_makecache.stdout | default(''))
              | trim | truncate(400) }}
       when:
@@ -232,26 +285,35 @@
               {% raw %}
               #!/usr/bin/env python3
               """
-              patch_classifier.py — used by apply_application_patches_smart.yml.
+              patch_classifier.py — used by apply_application_patches_smart.yml (v2)
 
               Classifies every pending update as "application" or "os" using
-              four layers, each falling through to the next only when it has
+              five layers, each falling through to the next only when it has
               no opinion:
 
-                1. FORCE lists            -> always wins (exclude beats include)
-                2. OS FLOOR (deterministic)-> Essential/Priority (Debian),
-                                              BaseOS/base repo (RHEL) - never
-                                              eligible even if layer 3/4 match
-                3. REPO ORIGIN (deterministic) -> non-OS-vendor repo = app
-                4. CURATED APP PATTERN (policy) -> well-known app software
-                                                    shipped from official repos
+                1. FORCE lists              -> always wins (exclude beats include)
+                2. OS FLOOR (deterministic) -> Essential/Priority (Debian),
+                                                BaseOS-equivalent repo (RHEL) —
+                                                never eligible even if 4/5 match
+                3. TRUSTED-BUT-CONTINUE     -> official-but-not-floor repo
+                                                (AppStream/updates/extras) or a
+                                                trusted internal mirror — no
+                                                verdict by itself, just skips
+                                                layer 4's shortcut
+                4. REPO ORIGIN (deterministic) -> non-trusted repo = application
+                5. CURATED APP PATTERN (policy) -> well-known app/DevOps
+                                                    software shipped from an
+                                                    official or trusted repo
 
-              Falls through all four -> classified "os" (safe default).
+              Falls through all five -> classified "os" (safe default).
               Never installs or modifies packages; always exits 0 and prints
-              valid JSON.
+              a single JSON object: {"patches": [...], "scan_error": "..."}.
+              Exceptions are captured into scan_error rather than swallowed.
               """
 
-              import fnmatch, json, os, re, shutil, subprocess, sys
+              import datetime, fnmatch, json, os, re, shutil, subprocess, sys
+
+              SCAN_TIME = datetime.datetime.utcnow().isoformat() + "Z"
 
               ARCH_SUFFIX_RE = re.compile(
                   r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
@@ -267,26 +329,50 @@
               ENABLE_REPO_ORIGIN  = os.environ.get("ENABLE_REPO_ORIGIN", "1") == "1"
               ENABLE_CURATED_APP  = os.environ.get("ENABLE_CURATED_APP", "1") == "1"
 
-              EXTRA_TRUSTED_HOSTS = env_list("TRUSTED_OS_REPO_HOSTS")
-              EXTRA_REDHAT_OS_PAT = env_list("OFFICIAL_REPO_PATTERNS_REDHAT")
+              EXTRA_TRUSTED_HOSTS   = env_list("TRUSTED_OS_REPO_HOSTS")
+              EXTRA_REDHAT_OS_PAT   = env_list("OFFICIAL_REPO_PATTERNS_REDHAT")
+              INTERNAL_REPO_HOSTS   = set(env_list("TRUSTED_INTERNAL_REPO_HOSTS"))
+              INTERNAL_REPO_PAT_RH  = env_list("TRUSTED_INTERNAL_REPO_PATTERNS")
 
-              # ── Layer 4 default curated application pattern list ────
-              # Well-known application software that commonly ships from
-              # the distro's own official repos. Extend/replace via
-              # EXTRA_APP_PATTERNS / APP_PATTERN_OVERRIDES.
+              # ── Layer 5 default curated application pattern list ────
+              # Well-known application/DevOps software that commonly ships
+              # from the distro's own official repos or a trusted mirror.
+              # Extend/replace via EXTRA_APP_PATTERNS / APP_PATTERN_OVERRIDES.
               DEFAULT_APP_PATTERNS = [
-                  "nginx*", "apache2*", "httpd*", "lighttpd*", "caddy*", "varnish*", "haproxy*",
+                  # web / proxy / load-balancing
+                  "nginx*", "apache2*", "httpd*", "lighttpd*", "caddy*", "openresty*",
+                  "varnish*", "haproxy*", "traefik*",
+                  # databases / caches / queues
                   "mysql-server*", "mysql-community-server*", "mariadb-server*", "mariadb*",
                   "postgresql*", "mongodb*", "redis*", "memcached*", "cassandra*", "couchdb*",
+                  "rabbitmq-server*",
+                  # language runtimes / frameworks
                   "php*", "python3-django*", "python3-flask*", "ruby*", "rails*",
                   "nodejs*", "npm*", "golang*",
                   "openjdk*", "java-*-openjdk*", "tomcat*", "wildfly*", "jboss*",
+                  # containers / orchestration
                   "docker-ce*", "docker-ee*", "containerd.io*", "podman*", "buildah*", "moby*",
-                  "grafana*", "prometheus*", "elasticsearch*", "kibana*", "logstash*", "filebeat*",
-                  "metricbeat*", "jenkins*", "gitlab-ce*", "gitlab-ee*", "rabbitmq-server*",
-                  "zabbix*", "nagios*", "icinga*", "vault*", "consul*", "nomad*", "terraform*",
-                  "kubelet*", "kubeadm*", "kubectl*", "kube-*", "minio*", "influxdb*", "telegraf*",
-                  "chronograf*", "kapacitor*", "wordpress*", "moodle*",
+                  "kubelet*", "kubeadm*", "kubectl*", "kube-*", "helm*", "istio*",
+                  "minikube*", "kind*",
+                  # observability
+                  "grafana*", "prometheus*", "elasticsearch*", "kibana*", "logstash*",
+                  "filebeat*", "metricbeat*",
+                  # CI/CD, SCM, artifact/registry
+                  "jenkins*", "gitlab-ce*", "gitlab-ee*", "sonarqube*", "nexus*",
+                  "artifactory*", "harbor*",
+                  "git", "git-*", "svn", "subversion*", "mercurial*",
+                  # monitoring / alerting
+                  "zabbix*", "nagios*", "icinga*",
+                  # config management / IaC / secrets
+                  "ansible*", "chef*", "puppet*", "puppet-agent*", "salt*", "salt-*",
+                  "vault*", "consul*", "nomad*", "terraform*", "packer*", "pulumi*",
+                  # cloud CLIs / agents
+                  "awscli*", "aws-cli*", "aws-ssm-agent*", "azure-cli*",
+                  "google-cloud-cli*", "google-cloud-sdk*",
+                  # time-series / metrics
+                  "minio*", "influxdb*", "telegraf*", "chronograf*", "kapacitor*",
+                  # misc apps
+                  "wordpress*", "moodle*",
               ]
 
               app_pattern_overrides = env_list("APP_PATTERN_OVERRIDES")
@@ -296,34 +382,51 @@
                   else DEFAULT_APP_PATTERNS + extra_app_patterns
               )
 
-              # ── Known OS-vendor repo hosts (Debian) — Layer 3 ────────
+              # ── Known OS-vendor repo hosts (Debian) — Layer 3/4 ──────
               TRUSTED_OS_REPO_HOSTS = set([
                   "archive.ubuntu.com", "security.ubuntu.com", "ports.ubuntu.com",
                   "old-releases.ubuntu.com", "changelogs.ubuntu.com",
+                  "mirror.ubuntu.com", "mirror.archive.ubuntu.com", "cloud.archive.ubuntu.com",
                   "deb.debian.org", "security.debian.org", "ftp.debian.org",
                   "http.kali.org", "kali.download", "cdn-fastly.deb.debian.org",
                   "mirror.kali.org",
               ]) | set(EXTRA_TRUSTED_HOSTS)
 
-              # ── Known official OS repo-name patterns (RHEL-family) ───
-              OFFICIAL_REDHAT_REPO_PATTERNS = [
-                  r"base", r"baseos", r"appstream", r"^updates", r"^extras", r"^epel",
-                  r"^plus$", r"^devel$", r"^ha$", r"^resilientstorage$", r"^powertools",
-                  r"^crb$", r"centos-", r"almalinux-", r"rocky-", r"^rhel-",
+              # ── Official RHEL-family repo tiers ──────────────────────
+              # BASEOS: hard floor (Layer 2) — never eligible.
+              # CONTINUE: official but not floor (Layer 3) — falls through
+              #           to curated pattern (Layer 5) instead of an
+              #           automatic OS verdict. AppStream lives here.
+              # EPEL is deliberately NOT in either tier — it behaves like
+              # a third-party repo (Layer 4) per production review.
+              REDHAT_BASEOS_PATTERNS = [r"\bbaseos\b", r"^base$"]
+              REDHAT_CONTINUE_PATTERNS = [
+                  r"appstream", r"^updates$", r"^extras$", r"^plus$", r"^devel$",
+                  r"^ha$", r"^resilientstorage$", r"^powertools", r"^crb$",
+                  r"centos-", r"almalinux-", r"rocky-", r"^rhel-",
               ] + EXTRA_REDHAT_OS_PAT
 
               def matches_any_pattern(name, patterns):
                   return any(fnmatch.fnmatch(name, pat) for pat in patterns)
 
-              def classify_common(name):
-                  """Layer 1 (force) — returns (classification, reason) or None."""
+              def matches_any_regex(text, patterns):
+                  low = text.lower()
+                  return any(re.search(pat, low) for pat in patterns)
+
+              def classify_force(name):
+                  """Layer 1 — returns (classification, layer, reason) or None."""
                   if name in FORCE_EXCLUDE:
-                      return ("os", "force_exclude")
+                      return ("os", "force", "force_exclude")
                   if name in FORCE_APP_PACKAGES:
-                      return ("application", "force_application_packages")
+                      return ("application", "force", "force_application_packages")
                   if matches_any_pattern(name, FORCE_APP_PATTERNS):
-                      return ("application", "force_application_patterns")
+                      return ("application", "force", "force_application_patterns")
                   return None
+
+              def classify_curated(name):
+                  if ENABLE_CURATED_APP and matches_any_pattern(name, APP_PATTERNS):
+                      return ("application", "curated_pattern", "curated_app_pattern")
+                  return ("os", "ambiguous_default", "ambiguous_default_os")
 
               def run(cmd, timeout=180):
                   try:
@@ -340,8 +443,75 @@
               # ══════════════════════════════════════════════════════════
               # Debian / Ubuntu / Kali
               # ══════════════════════════════════════════════════════════
+              def repo_type_debian(host):
+                  if not host:
+                      return "unknown"
+                  if host in TRUSTED_OS_REPO_HOSTS:
+                      return "official"
+                  if host in INTERNAL_REPO_HOSTS:
+                      return "internal"
+                  return "third_party"
+
+              def classify_debian_record(name, essential, priority, repo_host):
+                  forced = classify_force(name)
+                  if forced:
+                      classification, layer, reason = forced
+                      return classification, layer, reason
+
+                  if essential or priority in ("required", "important"):
+                      return "os", "os_floor", f"os_floor:essential_or_priority({priority or 'essential'})"
+
+                  rtype = repo_type_debian(repo_host)
+                  if rtype in ("official", "internal"):
+                      # Trusted-but-continue (Layer 3): don't auto-decide, fall
+                      # through to curated pattern.
+                      classification, layer, reason = classify_curated(name)
+                      if classification == "os":
+                          reason = f"{rtype}_repo_no_app_match:{repo_host}"
+                      return classification, layer, reason
+
+                  if ENABLE_REPO_ORIGIN and repo_host:
+                      return "application", "repo_origin", f"repo_origin:{repo_host}"
+
+                  return classify_curated(name)
+
+              def try_python_apt_scan(pkg_names):
+                  """Optional fast/accurate path via python3-apt. Returns dict
+                  {pkg: {essential, priority, repo_host}} or None if unavailable."""
+                  try:
+                      import apt  # noqa: F401
+                  except ImportError:
+                      return None
+                  try:
+                      cache = apt.Cache()
+                      out = {}
+                      for name in pkg_names:
+                          if name not in cache:
+                              continue
+                          pkg = cache[name]
+                          cand = pkg.candidate
+                          if cand is None:
+                              continue
+                          essential = bool(getattr(pkg._pkg, "essential", False))
+                          priority = (cand.priority or "").lower()
+                          repo_host = ""
+                          if cand.origins:
+                              repo_host = cand.origins[0].site or ""
+                          out[name] = {
+                              "essential": essential, "priority": priority,
+                              "repo_host": repo_host,
+                              "installed": pkg.installed.version if pkg.installed else "",
+                              "candidate": cand.version,
+                          }
+                      return out
+                  except Exception:
+                      # Any failure opening/reading the cache (permissions, lock,
+                      # corrupt state) -> signal "not available", fall back.
+                      return None
+
               def get_apt_policy_and_source(pkgs):
-                  """Returns {pkg: {installed, candidate, essential, priority, repo_host}}"""
+                  """Fallback path: {pkg: {installed, candidate, repo_host}} via
+                  `apt-cache policy` text parsing."""
                   rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
                   result, cur_pkg = {}, None
                   for line in out.splitlines():
@@ -364,13 +534,10 @@
                           v = mc.group(1)
                           result[cur_pkg]["candidate"] = "" if v == "(none)" else v
                           continue
-                      # version-table repo line, e.g.:
-                      #   500 http://archive.ubuntu.com/ubuntu focal-updates/main amd64 Packages
                       murl = re.match(r"\s+\d+\s+(https?|file)://([^/\s]+)", line)
                       if murl and result[cur_pkg].get("candidate_repo_pending"):
                           result[cur_pkg]["repo_host"] = murl.group(2)
                           result[cur_pkg]["candidate_repo_pending"] = False
-                      # mark that the *next* repo line belongs to the candidate version
                       mver = re.match(r"\s+\*?\*?(\S+)\s+\d+", line)
                       if mver and result[cur_pkg]["candidate"] != "unknown" \
                               and mver.group(1) == result[cur_pkg]["candidate"]:
@@ -378,10 +545,8 @@
                   return result
 
               def get_apt_priority_essential(pkgs):
-                  """Returns {pkg: {essential: bool, priority: str}} via apt-cache show."""
                   rc, out, _ = run(["apt-cache", "show", *pkgs], timeout=120)
                   result = {}
-                  cur_pkg = None
                   for block in out.split("\n\n"):
                       name_m = re.search(r"^Package:\s*(\S+)", block, re.M)
                       if not name_m:
@@ -406,6 +571,30 @@
                   if not pkgs:
                       return []
 
+                  py_apt = try_python_apt_scan(pkgs) if os.environ.get("HAVE_PYTHON_APT") == "1" else None
+
+                  if py_apt is not None:
+                      results = []
+                      for pkg in pkgs:
+                          meta = py_apt.get(pkg, {})
+                          cur_ver = meta.get("installed", "") or "unknown"
+                          new_ver = meta.get("candidate", "") or "unknown"
+                          repo_host = meta.get("repo_host", "")
+                          classification, layer, reason = classify_debian_record(
+                              pkg, meta.get("essential", False), meta.get("priority", ""), repo_host
+                          )
+                          results.append({
+                              "name": pkg, "current_version": cur_ver, "new_version": new_ver,
+                              "package_manager": "apt",
+                              "repository": repo_host or "unknown",
+                              "repository_type": repo_type_debian(repo_host),
+                              "classification": classification,
+                              "classification_layer": layer, "reason": reason,
+                              "scan_time": SCAN_TIME,
+                          })
+                      return results
+
+                  # Fallback: apt-cache text parsing
                   policy = get_apt_policy_and_source(pkgs)
                   pe = get_apt_priority_essential(pkgs)
 
@@ -417,22 +606,17 @@
                       repo_host = pol.get("repo_host", "")
                       meta = pe.get(pkg, {"essential": False, "priority": ""})
 
-                      forced = classify_common(pkg)
-                      if forced:
-                          classification, reason = forced
-                      elif meta["essential"] or meta["priority"] in ("required", "important"):
-                          classification, reason = "os", "os_floor:essential_or_priority"
-                      elif ENABLE_REPO_ORIGIN and repo_host and repo_host not in TRUSTED_OS_REPO_HOSTS:
-                          classification, reason = "application", f"repo_origin:{repo_host}"
-                      elif ENABLE_CURATED_APP and matches_any_pattern(pkg, APP_PATTERNS):
-                          classification, reason = "application", "curated_app_pattern"
-                      else:
-                          classification, reason = "os", "ambiguous_default_os"
-
+                      classification, layer, reason = classify_debian_record(
+                          pkg, meta["essential"], meta["priority"], repo_host
+                      )
                       results.append({
                           "name": pkg, "current_version": cur_ver, "new_version": new_ver,
-                          "repo_or_source": repo_host or "unknown",
-                          "classification": classification, "reason": reason,
+                          "package_manager": "apt",
+                          "repository": repo_host or "unknown",
+                          "repository_type": repo_type_debian(repo_host),
+                          "classification": classification,
+                          "classification_layer": layer, "reason": reason,
+                          "scan_time": SCAN_TIME,
                       })
                   return results
 
@@ -442,16 +626,56 @@
               def strip_arch(name_dot_arch):
                   return ARCH_SUFFIX_RE.sub("", name_dot_arch)
 
-              def is_official_redhat_repo(reponame):
+              def redhat_repo_type(reponame):
+                  if reponame == "unknown":
+                      return "unknown"
                   low = reponame.lower()
-                  return any(re.search(pat, low) for pat in OFFICIAL_REDHAT_REPO_PATTERNS)
+                  if matches_any_regex(low, REDHAT_BASEOS_PATTERNS):
+                      return "baseos"
+                  if matches_any_regex(low, REDHAT_CONTINUE_PATTERNS):
+                      return "official_continue"
+                  if INTERNAL_REPO_PAT_RH and matches_any_regex(low, INTERNAL_REPO_PAT_RH):
+                      return "internal"
+                  if "epel" in low:
+                      return "epel"
+                  return "third_party"
+
+              def classify_redhat_record(name, reponame):
+                  forced = classify_force(name)
+                  if forced:
+                      return forced
+
+                  rtype = redhat_repo_type(reponame)
+
+                  if rtype == "baseos":
+                      return "os", "os_floor", f"os_floor:baseos:{reponame}"
+
+                  if rtype in ("official_continue", "internal"):
+                      classification, layer, reason = classify_curated(name)
+                      if classification == "os":
+                          reason = f"{rtype}_repo_no_app_match:{reponame}"
+                      return classification, layer, reason
+
+                  # epel / third_party / unknown -> repo origin layer
+                  if ENABLE_REPO_ORIGIN and reponame != "unknown":
+                      return "application", "repo_origin", f"repo_origin:{reponame}"
+
+                  return classify_curated(name)
+
+              def detect_pkg_mgr():
+                  if shutil.which("dnf5"):
+                      return "dnf5", shutil.which("dnf5")
+                  if shutil.which("dnf"):
+                      return "dnf", shutil.which("dnf")
+                  if shutil.which("yum"):
+                      return "yum", shutil.which("yum")
+                  return None, None
 
               def scan_redhat():
-                  mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
+                  mgr_name, mgr = detect_pkg_mgr()
                   if not mgr:
                       return []
 
-                  # repoquery gives us "name repo" for every pending upgrade in one shot
                   rc, out, _ = run(
                       [mgr, "-q", "repoquery", "--upgrades", "--qf", "%{name} %{reponame}"],
                       timeout=300,
@@ -464,7 +688,6 @@
                               pkg_repo[parts[0]] = parts[1]
 
                   if not pkg_repo:
-                      # fallback: check-update without repo attribution
                       rc2, out2, _ = run([mgr, "-q", "check-update"], timeout=600)
                       if rc2 not in (0, 100):
                           return []
@@ -526,42 +749,33 @@
                       a, i = avail.get(pkg, {}), installed.get(pkg, {})
                       reponame = pkg_repo.get(pkg, "unknown")
 
-                      forced = classify_common(pkg)
-                      if forced:
-                          classification, reason = forced
-                      elif reponame != "unknown" and is_official_redhat_repo(reponame):
-                          if ENABLE_CURATED_APP and matches_any_pattern(pkg, APP_PATTERNS):
-                              classification, reason = "application", "curated_app_pattern"
-                          else:
-                              classification, reason = "os", f"os_floor:official_repo:{reponame}"
-                      elif ENABLE_REPO_ORIGIN and reponame != "unknown":
-                          classification, reason = "application", f"repo_origin:{reponame}"
-                      elif ENABLE_CURATED_APP and matches_any_pattern(pkg, APP_PATTERNS):
-                          classification, reason = "application", "curated_app_pattern"
-                      else:
-                          classification, reason = "os", "ambiguous_default_os"
+                      classification, layer, reason = classify_redhat_record(pkg, reponame)
 
                       results.append({
                           "name": pkg,
                           "current_version": fmt_version(i),
                           "new_version": fmt_version(a),
-                          "repo_or_source": reponame,
-                          "classification": classification, "reason": reason,
+                          "package_manager": mgr_name,
+                          "repository": reponame,
+                          "repository_type": redhat_repo_type(reponame),
+                          "classification": classification,
+                          "classification_layer": layer, "reason": reason,
+                          "scan_time": SCAN_TIME,
                       })
                   return results
 
               def main():
                   os_family = sys.argv[1] if len(sys.argv) > 1 else ""
+                  scan_error = ""
+                  patches = []
                   try:
                       if os_family == "Debian":
                           patches = scan_debian()
                       elif os_family == "RedHat":
                           patches = scan_redhat()
-                      else:
-                          patches = []
-                  except Exception:
-                      patches = []
-                  print(json.dumps(patches))
+                  except Exception as exc:
+                      scan_error = f"{type(exc).__name__}: {exc}"
+                  print(json.dumps({"patches": patches, "scan_error": scan_error}))
 
               if __name__ == "__main__":
                   main()
@@ -588,11 +802,17 @@
             APP_PATTERN_OVERRIDES: "{{ application_pattern_overrides | join(',') }}"
             TRUSTED_OS_REPO_HOSTS: "{{ trusted_os_repo_hosts | join(',') }}"
             OFFICIAL_REPO_PATTERNS_REDHAT: "{{ official_repo_patterns_redhat | join(',') }}"
+            TRUSTED_INTERNAL_REPO_HOSTS: "{{ trusted_internal_repo_hosts | join(',') }}"
+            TRUSTED_INTERNAL_REPO_PATTERNS: "{{ trusted_internal_repo_patterns | join(',') }}"
+            HAVE_PYTHON_APT: "{{ '1' if (python3_apt_probe is defined and (python3_apt_probe.rc | default(1)) == 0) else '0' }}"
 
         - name: Parse patch classifier output
           block:
             - set_fact:
-                all_pending: "{{ scan_result.stdout | from_json }}"
+                classifier_output: "{{ scan_result.stdout | from_json }}"
+            - set_fact:
+                all_pending: "{{ classifier_output.patches | default([]) }}"
+                scan_error: "{{ classifier_output.scan_error | default('') }}"
           rescue:
             - set_fact:
                 all_pending: []
@@ -601,42 +821,60 @@
                   {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
                      | trim | truncate(300) }}
 
+        - name: "Report — classifier reported an internal scan_error (non-fatal, using partial/empty results)"
+          debug:
+            msg: "Classifier scan_error on {{ inventory_hostname }}: {{ scan_error }}"
+          when:
+            - scan_error is defined
+            - scan_error | length > 0
+
         - name: Build matched (application) and ambiguous package lists
           set_fact:
             matched_packages: "{{ all_pending | selectattr('classification', 'equalto', 'application') | map(attribute='name') | list }}"
-            ambiguous_packages: "{{ all_pending | selectattr('reason', 'equalto', 'ambiguous_default_os') | map(attribute='name') | list }}"
+            ambiguous_packages: "{{ all_pending | selectattr('classification_layer', 'equalto', 'ambiguous_default') | map(attribute='name') | list }}"
 
         - name: Report — no pending updates classified as application
           debug:
             msg: >-
-              {{ scan_error if scan_error else
-                 (all_pending | length) ~ ' pending update(s) on ' ~ inventory_hostname ~
+              {{ (all_pending | length) ~ ' pending update(s) on ' ~ inventory_hostname ~
                  ', none classified as application. Nothing to do.' }}
           when: (matched_packages | length) == 0
 
         # ─────────────────────────────────────────────────────────────
-        # Apply — ONLY packages classified "application". OS/base/kernel
-        # packages detected in the scan are deliberately never named
-        # here, so they are never touched by this playbook.
+        # Apply — ONLY packages classified "application", installed in
+        # batches (package_install_batch_size, default 50) to avoid rare
+        # arg-length limits on hosts with very large application sets.
+        # A failure in one batch is caught by the rescue block below and
+        # reported; batches after the failing one are NOT attempted for
+        # that host (Ansible stops the loop on task failure by design —
+        # this keeps failure semantics simple and auditable).
         # ─────────────────────────────────────────────────────────────
-        - name: Apply application patches (failure-contained)
+        - name: Apply application patches (failure-contained, batched)
           block:
-            - name: "[Debian/Kali] Install matched application packages"
+            - name: "[Debian/Kali] Install matched application packages (batched)"
               apt:
-                name: "{{ matched_packages }}"
+                name: "{{ install_batch }}"
                 state: latest
                 update_cache: no
                 install_recommends: no
+              loop: "{{ matched_packages | batch(package_install_batch_size | int) | list }}"
+              loop_control:
+                loop_var: install_batch
+                label: "batch of {{ install_batch | length }} package(s)"
               register: apply_result_deb
               check_mode: "{{ dry_run | bool }}"
               when:
                 - ansible_os_family == "Debian"
                 - (matched_packages | length) > 0
 
-            - name: "[RedHat - dnf5] Install matched application packages"
+            - name: "[RedHat - dnf5] Install matched application packages (batched)"
               dnf5:
-                name: "{{ matched_packages }}"
+                name: "{{ install_batch }}"
                 state: latest
+              loop: "{{ matched_packages | batch(package_install_batch_size | int) | list }}"
+              loop_control:
+                loop_var: install_batch
+                label: "batch of {{ install_batch | length }} package(s)"
               register: apply_result_rh_dnf5
               check_mode: "{{ dry_run | bool }}"
               when:
@@ -644,10 +882,14 @@
                 - ansible_pkg_mgr == "dnf5"
                 - (matched_packages | length) > 0
 
-            - name: "[RedHat - dnf] Install matched application packages"
+            - name: "[RedHat - dnf] Install matched application packages (batched)"
               dnf:
-                name: "{{ matched_packages }}"
+                name: "{{ install_batch }}"
                 state: latest
+              loop: "{{ matched_packages | batch(package_install_batch_size | int) | list }}"
+              loop_control:
+                loop_var: install_batch
+                label: "batch of {{ install_batch | length }} package(s)"
               register: apply_result_rh_dnf
               check_mode: "{{ dry_run | bool }}"
               when:
@@ -655,10 +897,14 @@
                 - ansible_pkg_mgr == "dnf"
                 - (matched_packages | length) > 0
 
-            - name: "[RedHat - yum] Install matched application packages"
+            - name: "[RedHat - yum] Install matched application packages (batched)"
               yum:
-                name: "{{ matched_packages }}"
+                name: "{{ install_batch }}"
                 state: latest
+              loop: "{{ matched_packages | batch(package_install_batch_size | int) | list }}"
+              loop_control:
+                loop_var: install_batch
+                label: "batch of {{ install_batch | length }} package(s)"
               register: apply_result_rh_yum
               check_mode: "{{ dry_run | bool }}"
               when:
@@ -678,11 +924,24 @@
                   }}
               when: ansible_os_family == "RedHat"
 
+            - name: Compute aggregate "changed" across all install batches
+              set_fact:
+                apply_changed_deb: >-
+                  {{
+                    (apply_result_deb.results | default([]) | map(attribute='changed') | select('equalto', true) | list | length) > 0
+                  }}
+                apply_changed_rh: >-
+                  {{
+                    (apply_result_rh.results | default([]) | map(attribute='changed') | select('equalto', true) | list | length) > 0
+                  }}
+
           rescue:
             - name: Capture package installation failure (don't abort this host's run)
               set_fact:
                 install_error: >-
-                  {{ (ansible_failed_result.msg | default('Package installation failed; see AWX job output for the failed task')) | truncate(500) }}
+                  {{ (ansible_failed_result.msg | default('Package installation failed in one of the install batches; see AWX job output for the failed batch')) | truncate(500) }}
+                apply_changed_deb: "{{ apply_changed_deb | default(false) }}"
+                apply_changed_rh: "{{ apply_changed_rh | default(false) }}"
 
             - name: Report installation failure and continue to reporting steps
               debug:
@@ -716,6 +975,15 @@
         - ansible_os_family == "Debian"
         - not (no_targets_given | bool)
 
+    - name: "[RedHat] Check whether needs-restarting is actually available"
+      shell: command -v needs-restarting
+      register: needs_restarting_present
+      changed_when: false
+      failed_when: false
+      when:
+        - ansible_os_family == "RedHat"
+        - not (no_targets_given | bool)
+
     - name: "[RedHat] Check if the OS reports a reboot is required"
       command: needs-restarting -r
       register: rh_reboot_check
@@ -724,6 +992,20 @@
       when:
         - ansible_os_family == "RedHat"
         - not (no_targets_given | bool)
+        - needs_restarting_present.rc | default(1) == 0
+
+    - name: "[RedHat] Note reboot detection was skipped (needs-restarting unavailable)"
+      debug:
+        msg: >-
+          needs-restarting is not available on {{ inventory_hostname }}
+          (dnf-utils/yum-utils install may have failed) — reboot
+          detection skipped, assuming no reboot required. Application
+          packages essentially never need one, but review manually if
+          in doubt.
+      when:
+        - ansible_os_family == "RedHat"
+        - not (no_targets_given | bool)
+        - needs_restarting_present.rc | default(1) != 0
 
     - name: Determine whether a reboot is warranted (authoritative OS check)
       set_fact:
@@ -732,7 +1014,7 @@
             (deb_reboot_check.stat.exists | default(false))
             if ansible_os_family == "Debian"
             else ((rh_reboot_check.rc | default(0)) == 1)
-            if ansible_os_family == "RedHat"
+            if (ansible_os_family == "RedHat" and (needs_restarting_present.rc | default(1)) == 0)
             else false
           }}
 
@@ -745,14 +1027,14 @@
         - reboot_if_required | bool
         - reboot_required | bool
         - not (dry_run | bool)
-        - (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false))
+        - (apply_changed_deb | default(false)) or (apply_changed_rh | default(false))
 
     # ───────────────────────────────────────────────────────────────────
     # Report + publish to AWX job stats — both per-host (for the AWX UI)
     # and a single aggregated artifact (per_host: false, reliable for any
     # external caller polling the API).
     # ───────────────────────────────────────────────────────────────────
-    - name: Build detailed applied-package log (old version, new version, classification reason, run time)
+    - name: Build detailed applied-package log and ambiguous-review list
       set_fact:
         application_patch_details: >-
           {{
@@ -779,8 +1061,10 @@
           - "Classified application   : {{ application_patch_details | default([]) | length }}"
           - "Classified OS (untouched): {{ (all_pending | default([]) | length) - (matched_packages | default([]) | length) }}"
           - "  ...of which ambiguous  : {{ classification_ambiguous_left_as_os | default([]) | length }} (review these — see below)"
+          - "Install batch size       : {{ package_install_batch_size }}"
           - "Reboot required          : {{ reboot_required | default(false) }}"
           - "Install error            : {{ install_error if install_error else '(none)' }}"
+          - "Scan error               : {{ scan_error if scan_error else '(none)' }}"
           - "==========================================================================================="
       when: not (no_targets_given | bool)
 
@@ -788,7 +1072,8 @@
       debug:
         msg: >-
           {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
-          [{{ item.reason }}, source={{ item.repo_or_source }}]
+          [{{ item.classification_layer }}/{{ item.reason }},
+          pkg_mgr={{ item.package_manager }}, repo={{ item.repository }} ({{ item.repository_type }})]
       loop: "{{ application_patch_details | default([]) }}"
       loop_control:
         label: "{{ item.name }}"
@@ -800,7 +1085,8 @@
       debug:
         msg: >-
           {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
-          [source={{ item.repo_or_source }}] — no layer matched; left as OS by default.
+          [pkg_mgr={{ item.package_manager }}, repo={{ item.repository }} ({{ item.repository_type }})]
+          — no layer matched; left as OS by default.
       loop: "{{ classification_ambiguous_left_as_os | default([]) }}"
       loop_control:
         label: "{{ item.name }}"
@@ -817,7 +1103,7 @@
           application_patched:  "{{ application_patch_details | default([]) }}"
           ambiguous_left_as_os: "{{ classification_ambiguous_left_as_os | default([]) }}"
           pending_left:         "{{ (all_pending | default([]) | length) - (matched_packages | default([]) | length) }}"
-          changed:              "{{ (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false)) }}"
+          changed:              "{{ (apply_changed_deb | default(false)) or (apply_changed_rh | default(false)) }}"
           reboot_required:      "{{ reboot_required | default(false) }}"
           reboot_done:          "{{ (reboot_if_required | bool) and (reboot_required | default(false) | bool) and not (dry_run | bool) }}"
           install_error:        "{{ install_error }}"
