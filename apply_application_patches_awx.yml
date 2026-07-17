@@ -1,43 +1,64 @@
 ---
-# apply_application_patches_smart.yml  (v2)
+# apply_application_patches_smart.yml  (v3 — production)
 #
 # Self-contained AWX job: scans a host for pending package updates and
 # classifies each one as "application" or "os" using a LAYERED,
 # metadata-first classifier — then installs only the ones classified
 # "application". OS/kernel/systemd/etc. pending updates are always left
-# completely untouched by this playbook (patch them with your OS
-# playbook / security playbook instead).
+# completely untouched by direct classification (see v3 dependency-
+# impact guard below for the one remaining indirect case this can't
+# fully eliminate).
 #
-# v2 CHANGELOG (production review fixes)
+# v3 CHANGELOG (adds two production guards on top of v2)
 # ---------------------------------------------------------------------
-#  - AppStream is no longer part of the RHEL OS floor. Only BaseOS (and
-#    equivalents) is a hard floor now; AppStream/extras/plus/devel/etc.
-#    are "official but continue" — they still get a chance to match the
+#  - MAJOR VERSION GUARD: an "application" classified package is
+#    additionally checked for a major-version jump (e.g. nginx 1.24 ->
+#    1.27, postgresql 15 -> 16). If detected, and the package wasn't
+#    force-included, it is reclassified to major_version_blocked and
+#    reported separately instead of being auto-installed. Controlled by
+#    block_major_version_bumps (default true) and
+#    major_version_bump_allowlist (exact names / fnmatch globs that are
+#    always allowed to jump).
+#  - DEPENDENCY-IMPACT PRE-CHECK: before the real install, each install
+#    batch is simulated (apt-get -s install / dnf --assumeno install).
+#    If the simulation shows the batch would additionally pull in a
+#    package on the OS-floor reference set (kernel/glibc/systemd/etc,
+#    plus whatever the classifier itself flagged as os_floor on this
+#    host), that batch is excluded from the real install and reported
+#    under dependency_conflict_packages instead of being silently
+#    applied. This is the one gap direct classification cannot close by
+#    itself: classification controls what you *ask* to install, not
+#    what the package manager's dependency solver pulls in alongside
+#    it.
+#  - Report now carries three distinct, separately-labeled review
+#    buckets: classification_ambiguous_left_as_os (classifier had no
+#    opinion), major_version_blocked (bigger jump than "patch" implies),
+#    dependency_conflict_packages (would drag in a floored package).
+#    Nothing in any of the three is installed silently.
+#
+# v2 changes carried forward from the prior review pass
+# ---------------------------------------------------------------------
+#  - AppStream is not part of the RHEL OS floor; only BaseOS (and
+#    equivalents) is a hard floor. AppStream/extras/plus/devel/etc. are
+#    "official but continue" and still get a chance to match the
 #    curated application pattern before falling back to OS.
-#  - EPEL is no longer treated as an official repo. It now behaves like
-#    any other third-party repo (Layer 3), so EPEL-sourced packages
-#    classify as application unless curated/forced otherwise.
-#  - Curated pattern list expanded with common DevOps/infra tooling
-#    (ansible, helm, istio, traefik, git*, cloud CLIs, config-mgmt
-#    tools, harbor/sonarqube/nexus/artifactory, minikube/kind, etc.)
-#  - New trust tier: trusted_internal_repo_hosts / _patterns for
-#    internal mirrors (Artifactory/Nexus/apt.company.local/etc.) — these
-#    get "official but continue" treatment like AppStream, not an
-#    automatic OS-or-application verdict.
-#  - Debian classification prefers python3-apt (if importable and the
-#    apt cache opens cleanly) for essential/priority/origin data, with
-#    automatic fallback to apt-cache text parsing if it isn't available.
+#  - EPEL is not treated as an official repo — behaves like any other
+#    third-party repo (Layer 4).
+#  - Curated pattern list covers common DevOps/infra tooling.
+#  - trusted_internal_repo_hosts / _patterns for internal mirrors
+#    (Artifactory/Nexus/apt.company.local/etc.) get "official but
+#    continue" treatment, not an automatic verdict.
+#  - Debian classification prefers python3-apt when importable and the
+#    apt cache opens cleanly, with automatic fallback to apt-cache text
+#    parsing.
 #  - Package installs are batched (package_install_batch_size, default
-#    50) instead of one giant name list, to avoid rare shell/arg-length
-#    limits on hosts with very large application package sets.
+#    50) to avoid rare shell/arg-length limits on very large application
+#    package sets.
 #  - needs-restarting existence is checked with `command -v` before
 #    being invoked, for minimal images where dnf-utils install failed.
-#  - The classifier no longer swallows exceptions silently — scan_error
-#    is populated with the real exception text and surfaced in the AWX
+#  - The classifier never swallows exceptions silently — scan_error is
+#    populated with the real exception text and surfaced in the AWX
 #    report.
-#  - Every package record now reports: package_manager, repository,
-#    repository_type, classification_layer, reason, scan_time — in
-#    addition to classification/current_version/new_version.
 #
 # WHY LAYERED, NOT A SINGLE RULE
 # ---------------------------------------------------------------------
@@ -45,12 +66,15 @@
 # official "Type=Application" field anywhere in package metadata. A
 # single deterministic rule cannot separate application software from
 # OS infrastructure with high accuracy. This playbook stacks five
-# layers, each authoritative for the cases it covers, falling through
-# to the next layer only when the previous one has no opinion:
+# classification layers, each authoritative for the cases it covers,
+# falling through to the next only when the previous one has no
+# opinion — followed by two post-classification guards that can pull a
+# package back out of the install set even after Layer 1-5 said
+# "application":
 #
 #   Layer 1 — FORCE lists: force_exclude beats force_application_packages
 #             beats force_application_patterns. Explicit human judgement,
-#             always wins over every other layer.
+#             always wins over every other layer AND both guards below.
 #   Layer 2 — OS FLOOR (deterministic, metadata-only): Essential=yes or
 #             Priority in {required, important} on Debian; repo name
 #             matches BaseOS (and equivalents) on RHEL-family. NEVER
@@ -75,6 +99,15 @@
 #             automatically, so it's written down here, in one place,
 #             fully override-able via extra_application_patterns /
 #             application_pattern_overrides.
+#   Guard A — MAJOR VERSION JUMP: an application-classified package
+#             whose current->new version crosses a major-version
+#             boundary is pulled back to major_version_blocked unless
+#             force-included or allowlisted. Version policy, not
+#             identity classification.
+#   Guard B — DEPENDENCY IMPACT: an application-classified batch that
+#             would, per package-manager simulation, also touch a
+#             floored OS package is excluded and reported as
+#             dependency_conflict_packages.
 #
 # Anything that falls through all five layers is classified "os" (safe
 # default) and reported separately in classification_ambiguous_left_as_os
@@ -85,7 +118,7 @@
 # misses. Point trusted_os_repo_hosts / official_repo_patterns_redhat /
 # trusted_internal_repo_hosts / trusted_internal_repo_patterns /
 # extra_application_patterns at your environment once and accuracy
-# converges toward the 98% target for a given fleet.
+# converges toward a high match rate for a given fleet.
 #
 # SAFETY: if force_application_packages, force_application_patterns,
 # AND enable_repo_origin_detection (false) AND
@@ -99,6 +132,7 @@
 #   force_application_packages      list of exact package names — ALWAYS
 #                                    treated as application, overrides
 #                                    every other layer including the OS floor
+#                                    AND both post-classification guards
 #   force_application_patterns      list of fnmatch globs — same as above
 #   force_exclude                   list of exact package names — NEVER
 #                                    patched by this playbook, overrides
@@ -123,7 +157,11 @@
 #                                    mirror reponames — same treatment
 #   package_install_batch_size      50 (default) — packages per install
 #                                    batch, avoids arg-length limits
-#   reboot_if_required              false (default)
+#   block_major_version_bumps       true (default) — Guard A on/off
+#   major_version_bump_allowlist    list of exact names / fnmatch globs
+#                                    always allowed to jump major version
+#   enable_dependency_impact_check  true (default) — Guard B on/off
+#   reboot_if_required               false (default)
 #   patch_serial                    '100%' (default) — Ansible `serial`
 #
 # Compatibility: Ubuntu/Debian/Kali (apt) and RHEL family
@@ -156,6 +194,10 @@
     official_repo_patterns_redhat: []
     trusted_internal_repo_hosts: []
     trusted_internal_repo_patterns: []
+
+    block_major_version_bumps: true
+    major_version_bump_allowlist: []
+    enable_dependency_impact_check: true
 
   tasks:
 
@@ -192,6 +234,7 @@
         norm_official_repo_patterns_redhat: "{{ [official_repo_patterns_redhat] if (official_repo_patterns_redhat is string) else (official_repo_patterns_redhat | default([])) }}"
         norm_trusted_internal_repo_hosts: "{{ [trusted_internal_repo_hosts] if (trusted_internal_repo_hosts is string) else (trusted_internal_repo_hosts | default([])) }}"
         norm_trusted_internal_repo_patterns: "{{ [trusted_internal_repo_patterns] if (trusted_internal_repo_patterns is string) else (trusted_internal_repo_patterns | default([])) }}"
+        norm_major_version_bump_allowlist: "{{ [major_version_bump_allowlist] if (major_version_bump_allowlist is string) else (major_version_bump_allowlist | default([])) }}"
 
     - name: Fail fast (per host) if every detection layer is disabled/empty
       set_fact:
@@ -298,12 +341,18 @@
         scan_error: ""
         matched_packages: []
         ambiguous_packages: []
+        major_version_blocked_packages: []
+        floor_reference_set: []
+        dependency_conflict_packages: []
         install_error: ""
 
     # ───────────────────────────────────────────────────────────────────
     # Scan + classify — lists every pending update on the host, tags
     # each one with its classification layer and reason. Never installs
-    # or modifies anything by itself.
+    # or modifies anything by itself. Also applies the major-version-jump
+    # guard (Guard A) inline, so an "application" verdict from Layers 1-5
+    # can still be pulled back to major_version_blocked here before the
+    # result ever leaves the remote host.
     # ───────────────────────────────────────────────────────────────────
     - name: Scan and classify pending updates
       when:
@@ -319,11 +368,11 @@
               {% raw %}
               #!/usr/bin/env python3
               """
-              patch_classifier.py — used by apply_application_patches_smart.yml (v2)
+              patch_classifier.py — used by apply_application_patches_smart.yml (v3)
 
               Classifies every pending update as "application" or "os" using
               five layers, each falling through to the next only when it has
-              no opinion:
+              no opinion, followed by an in-script major-version-jump guard:
 
                 1. FORCE lists              -> always wins (exclude beats include)
                 2. OS FLOOR (deterministic) -> Essential/Priority (Debian),
@@ -338,11 +387,20 @@
                 5. CURATED APP PATTERN (policy) -> well-known app/DevOps
                                                     software shipped from an
                                                     official or trusted repo
+                Guard A. MAJOR VERSION JUMP  -> application verdict is pulled
+                                                back to major_version_blocked
+                                                unless force-included or
+                                                allowlisted.
 
-              Falls through all five -> classified "os" (safe default).
+              Falls through all five layers -> classified "os" (safe default).
               Never installs or modifies packages; always exits 0 and prints
-              a single JSON object: {"patches": [...], "scan_error": "..."}.
+              a single JSON object:
+              {"patches": [...], "scan_error": "...", "floor_reference_set": [...]}
               Exceptions are captured into scan_error rather than swallowed.
+              floor_reference_set is the union of the static critical-package
+              list and every package this run classified os_floor — consumed
+              by the playbook's dependency-impact pre-check (Guard B), which
+              runs on the control/remote side after this script exits.
               """
 
               import datetime, fnmatch, json, os, re, shutil, subprocess, sys
@@ -367,6 +425,9 @@
               EXTRA_REDHAT_OS_PAT   = env_list("OFFICIAL_REPO_PATTERNS_REDHAT")
               INTERNAL_REPO_HOSTS   = set(env_list("TRUSTED_INTERNAL_REPO_HOSTS"))
               INTERNAL_REPO_PAT_RH  = env_list("TRUSTED_INTERNAL_REPO_PATTERNS")
+
+              BLOCK_MAJOR_BUMPS     = os.environ.get("BLOCK_MAJOR_BUMPS", "1") == "1"
+              MAJOR_BUMP_ALLOWLIST  = env_list("MAJOR_BUMP_ALLOWLIST")
 
               # ── Layer 5 default curated application pattern list ────
               # Well-known application/DevOps software that commonly ships
@@ -416,6 +477,22 @@
                   else DEFAULT_APP_PATTERNS + extra_app_patterns
               )
 
+              # ── Static critical-package floor, always included in the
+              # floor_reference_set regardless of what's pending this run.
+              # Used by the playbook's dependency-impact pre-check (Guard B)
+              # to catch collateral changes to packages that aren't even in
+              # today's pending-update list. ────────────────────────────
+              STATIC_FLOOR_NAMES = {
+                  "kernel", "kernel-core", "kernel-modules", "glibc", "glibc-common",
+                  "systemd", "systemd-libs", "systemd-udev", "systemd-sysv",
+                  "bash", "coreutils", "util-linux", "filesystem", "shadow-utils",
+                  "rpm", "rpm-libs", "dnf", "dnf5", "yum", "apt", "apt-utils", "dpkg",
+                  "openssh", "openssh-server", "openssh-clients", "sudo",
+                  "selinux-policy", "selinux-policy-targeted", "grub2", "grub2-common",
+                  "shim", "shim-x64", "dracut", "networkmanager", "network-manager",
+                  "libc6", "libc-bin", "libc6-dev",
+              }
+
               # ── Known OS-vendor repo hosts (Debian) — Layer 3/4 ──────
               TRUSTED_OS_REPO_HOSTS = set([
                   "archive.ubuntu.com", "security.ubuntu.com", "ports.ubuntu.com",
@@ -462,6 +539,49 @@
                       return ("application", "curated_pattern", "curated_app_pattern")
                   return ("os", "ambiguous_default", "ambiguous_default_os")
 
+              # ── Guard A: major-version-jump detection ────────────────
+              def extract_major(version_str):
+                  """
+                  Best-effort 'major' token extraction across deb and rpm version
+                  schemes. Deliberately conservative: if we can't confidently
+                  parse a major token, return None — callers must treat None as
+                  'cannot determine, do not block'. This avoids false positives
+                  that would block a package that isn't actually doing a major
+                  version bump.
+
+                  Deb:  [epoch:]upstream[-debian_revision]
+                  Rpm:  version-release (epoch handled separately upstream)
+                  Both: take the leading digit run after stripping epoch/release.
+                  """
+                  if not version_str or version_str in ("unknown", ""):
+                      return None
+                  v = version_str.split(":", 1)[-1]   # drop epoch if present
+                  v = v.split("-", 1)[0]               # drop debian_revision / rpm release
+                  m = re.match(r"^(\d+)", v)
+                  return m.group(1) if m else None
+
+              def is_major_version_jump(current_version, new_version):
+                  cur_major = extract_major(current_version)
+                  new_major = extract_major(new_version)
+                  if cur_major is None or new_major is None:
+                      return False
+                  return cur_major != new_major
+
+              def major_bump_allowlisted(name):
+                  return name in MAJOR_BUMP_ALLOWLIST or matches_any_pattern(name, MAJOR_BUMP_ALLOWLIST)
+
+              def apply_major_version_guard(pkg, classification, layer, reason, cur_ver, new_ver):
+                  """Applied AFTER layer 1-5 classification. Force-included
+                  packages (layer == 'force') are exempt by design, matching
+                  Layer 1's 'always wins' contract."""
+                  if (classification == "application"
+                          and BLOCK_MAJOR_BUMPS
+                          and layer != "force"
+                          and not major_bump_allowlisted(pkg)
+                          and is_major_version_jump(cur_ver, new_ver)):
+                      return "os", "major_version_blocked", f"major_version_jump:{cur_ver}->{new_ver}"
+                  return classification, layer, reason
+
               def run(cmd, timeout=180):
                   try:
                       proc = subprocess.run(cmd, capture_output=True, text=True,
@@ -489,16 +609,13 @@
               def classify_debian_record(name, essential, priority, repo_host):
                   forced = classify_force(name)
                   if forced:
-                      classification, layer, reason = forced
-                      return classification, layer, reason
+                      return forced
 
                   if essential or priority in ("required", "important"):
                       return "os", "os_floor", f"os_floor:essential_or_priority({priority or 'essential'})"
 
                   rtype = repo_type_debian(repo_host)
                   if rtype in ("official", "internal"):
-                      # Trusted-but-continue (Layer 3): don't auto-decide, fall
-                      # through to curated pattern.
                       classification, layer, reason = classify_curated(name)
                       if classification == "os":
                           reason = f"{rtype}_repo_no_app_match:{repo_host}"
@@ -539,8 +656,6 @@
                           }
                       return out
                   except Exception:
-                      # Any failure opening/reading the cache (permissions, lock,
-                      # corrupt state) -> signal "not available", fall back.
                       return None
 
               def get_apt_policy_and_source(pkgs):
@@ -607,8 +722,9 @@
 
                   py_apt = try_python_apt_scan(pkgs) if os.environ.get("HAVE_PYTHON_APT") == "1" else None
 
+                  results = []
+
                   if py_apt is not None:
-                      results = []
                       for pkg in pkgs:
                           meta = py_apt.get(pkg, {})
                           cur_ver = meta.get("installed", "") or "unknown"
@@ -616,6 +732,9 @@
                           repo_host = meta.get("repo_host", "")
                           classification, layer, reason = classify_debian_record(
                               pkg, meta.get("essential", False), meta.get("priority", ""), repo_host
+                          )
+                          classification, layer, reason = apply_major_version_guard(
+                              pkg, classification, layer, reason, cur_ver, new_ver
                           )
                           results.append({
                               "name": pkg, "current_version": cur_ver, "new_version": new_ver,
@@ -632,7 +751,6 @@
                   policy = get_apt_policy_and_source(pkgs)
                   pe = get_apt_priority_essential(pkgs)
 
-                  results = []
                   for pkg in pkgs:
                       pol = policy.get(pkg, {})
                       cur_ver = pol.get("installed", "unknown") or "unknown"
@@ -642,6 +760,9 @@
 
                       classification, layer, reason = classify_debian_record(
                           pkg, meta["essential"], meta["priority"], repo_host
+                      )
+                      classification, layer, reason = apply_major_version_guard(
+                          pkg, classification, layer, reason, cur_ver, new_ver
                       )
                       results.append({
                           "name": pkg, "current_version": cur_ver, "new_version": new_ver,
@@ -690,7 +811,6 @@
                           reason = f"{rtype}_repo_no_app_match:{reponame}"
                       return classification, layer, reason
 
-                  # epel / third_party / unknown -> repo origin layer
                   if ENABLE_REPO_ORIGIN and reponame != "unknown":
                       return "application", "repo_origin", f"repo_origin:{reponame}"
 
@@ -782,13 +902,18 @@
                   for pkg in pkgs:
                       a, i = avail.get(pkg, {}), installed.get(pkg, {})
                       reponame = pkg_repo.get(pkg, "unknown")
+                      cur_ver = fmt_version(i)
+                      new_ver = fmt_version(a)
 
                       classification, layer, reason = classify_redhat_record(pkg, reponame)
+                      classification, layer, reason = apply_major_version_guard(
+                          pkg, classification, layer, reason, cur_ver, new_ver
+                      )
 
                       results.append({
                           "name": pkg,
-                          "current_version": fmt_version(i),
-                          "new_version": fmt_version(a),
+                          "current_version": cur_ver,
+                          "new_version": new_ver,
                           "package_manager": mgr_name,
                           "repository": reponame,
                           "repository_type": redhat_repo_type(reponame),
@@ -809,7 +934,15 @@
                           patches = scan_redhat()
                   except Exception as exc:
                       scan_error = f"{type(exc).__name__}: {exc}"
-                  print(json.dumps({"patches": patches, "scan_error": scan_error}))
+
+                  floor_seen = {p["name"] for p in patches if p.get("classification_layer") == "os_floor"}
+                  floor_reference_set = sorted(STATIC_FLOOR_NAMES | floor_seen)
+
+                  print(json.dumps({
+                      "patches": patches,
+                      "scan_error": scan_error,
+                      "floor_reference_set": floor_reference_set,
+                  }))
 
               if __name__ == "__main__":
                   main()
@@ -839,6 +972,8 @@
             TRUSTED_INTERNAL_REPO_HOSTS: "{{ norm_trusted_internal_repo_hosts | join(',') }}"
             TRUSTED_INTERNAL_REPO_PATTERNS: "{{ norm_trusted_internal_repo_patterns | join(',') }}"
             HAVE_PYTHON_APT: "{{ '1' if (python3_apt_probe is defined and (python3_apt_probe.rc | default(1)) == 0) else '0' }}"
+            BLOCK_MAJOR_BUMPS: "{{ '1' if (block_major_version_bumps | bool) else '0' }}"
+            MAJOR_BUMP_ALLOWLIST: "{{ norm_major_version_bump_allowlist | join(',') }}"
 
         - name: Parse patch classifier output
           block:
@@ -847,9 +982,11 @@
             - set_fact:
                 all_pending: "{{ classifier_output.patches | default([]) }}"
                 scan_error: "{{ classifier_output.scan_error | default('') }}"
+                floor_reference_set: "{{ classifier_output.floor_reference_set | default([]) }}"
           rescue:
             - set_fact:
                 all_pending: []
+                floor_reference_set: []
                 scan_error: >-
                   Patch classifier failed (rc={{ scan_result.rc }}):
                   {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
@@ -862,10 +999,11 @@
             - scan_error is defined
             - scan_error | length > 0
 
-        - name: Build matched (application) and ambiguous package lists
+        - name: Build matched (application), ambiguous, and major-version-blocked package lists
           set_fact:
             matched_packages: "{{ all_pending | selectattr('classification', 'equalto', 'application') | map(attribute='name') | list }}"
             ambiguous_packages: "{{ all_pending | selectattr('classification_layer', 'equalto', 'ambiguous_default') | map(attribute='name') | list }}"
+            major_version_blocked_packages: "{{ all_pending | selectattr('classification_layer', 'equalto', 'major_version_blocked') | map(attribute='name') | list }}"
 
         - name: Report — no pending updates classified as application
           debug:
@@ -875,13 +1013,99 @@
           when: (matched_packages | length) == 0
 
         # ─────────────────────────────────────────────────────────────
-        # Apply — ONLY packages classified "application", installed in
-        # batches (package_install_batch_size, default 50) to avoid rare
-        # arg-length limits on hosts with very large application sets.
-        # A failure in one batch is caught by the rescue block below and
-        # reported; batches after the failing one are NOT attempted for
-        # that host (Ansible stops the loop on task failure by design —
-        # this keeps failure semantics simple and auditable).
+        # Guard B — Dependency-impact pre-check. Classification controls
+        # what we ASK the package manager to install; it does not
+        # control what the dependency solver pulls in alongside it. This
+        # simulates each install batch and cross-checks the packages it
+        # would additionally touch against floor_reference_set. Any
+        # batch with a floor hit is excluded from matched_packages
+        # before the real install runs — everything downstream (install
+        # tasks, reporting) transparently sees only the filtered list.
+        # ─────────────────────────────────────────────────────────────
+        - name: Dependency-impact pre-check (Guard B)
+          when:
+            - (enable_dependency_impact_check | bool)
+            - (matched_packages | length) > 0
+          block:
+
+            - name: "[Debian] Simulate install per batch to detect collateral OS-floor changes"
+              shell: |
+                set -o pipefail
+                apt-get -s install --no-install-recommends {{ install_batch | join(' ') }} 2>&1 \
+                  | awk '/^Inst /{print $2}'
+              args:
+                executable: /bin/bash
+              environment: { LC_ALL: C, LANG: C }
+              loop: "{{ matched_packages | batch(package_install_batch_size | int) | list }}"
+              loop_control:
+                loop_var: install_batch
+                label: "simulate batch of {{ install_batch | length }}"
+              register: dep_sim_deb
+              changed_when: false
+              failed_when: false
+              when: ansible_os_family == "Debian"
+
+            - name: "[RedHat] Simulate install per batch to detect collateral OS-floor changes"
+              shell: |
+                set -o pipefail
+                mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+                "$mgr" -q --assumeno install {{ install_batch | join(' ') }} 2>&1 \
+                  | awk '/^ /{print $1}' | grep -v '^$'
+              args:
+                executable: /bin/bash
+              environment: { LC_ALL: C, LANG: C }
+              loop: "{{ matched_packages | batch(package_install_batch_size | int) | list }}"
+              loop_control:
+                loop_var: install_batch
+                label: "simulate batch of {{ install_batch | length }}"
+              register: dep_sim_rh
+              changed_when: false
+              failed_when: false
+              when: ansible_os_family == "RedHat"
+
+            - name: Compute batches with collateral floor-package impact and filter matched_packages
+              set_fact:
+                dependency_conflict_packages: >-
+                  {{
+                    (dep_sim_deb.results | default([]) + dep_sim_rh.results | default([]))
+                    | selectattr('stdout_lines', 'defined')
+                    | map(attribute='stdout_lines')
+                    | list
+                    | flatten
+                    | select('in', floor_reference_set | default([]))
+                    | unique
+                    | list
+                  }}
+                matched_packages: >-
+                  {{
+                    matched_packages
+                    | reject('in',
+                        ((dep_sim_deb.results | default([]) + dep_sim_rh.results | default([]))
+                         | selectattr('stdout_lines', 'defined')
+                         | selectattr('stdout_lines', 'intersect', floor_reference_set | default([]))
+                         | map(attribute='install_batch')
+                         | list | flatten))
+                    | list
+                  }}
+
+            - name: "Report — packages excluded due to collateral OS-floor impact"
+              debug:
+                msg: >-
+                  Excluded package(s) from install on {{ inventory_hostname }} because
+                  installing them would also touch floored OS package(s):
+                  {{ dependency_conflict_packages | join(', ') }}. Review manually
+                  (repo pinning or a floor-list adjustment may be needed).
+              when: (dependency_conflict_packages | length) > 0
+
+        # ─────────────────────────────────────────────────────────────
+        # Apply — ONLY packages that survived classification AND both
+        # guards, installed in batches (package_install_batch_size,
+        # default 50) to avoid rare arg-length limits on hosts with very
+        # large application package sets. A failure in one batch is
+        # caught by the rescue block below and reported; batches after
+        # the failing one are NOT attempted for that host (Ansible stops
+        # the loop on task failure by design — this keeps failure
+        # semantics simple and auditable).
         # ─────────────────────────────────────────────────────────────
         - name: Apply application patches (failure-contained, batched)
           block:
@@ -1094,7 +1318,7 @@
     # and a single aggregated artifact (per_host: false, reliable for any
     # external caller polling the API).
     # ───────────────────────────────────────────────────────────────────
-    - name: Build detailed applied-package log and ambiguous-review list
+    - name: Build detailed applied-package log and review-bucket lists
       set_fact:
         application_patch_details: >-
           {{
@@ -1107,6 +1331,12 @@
           {{
             all_pending
             | selectattr('name', 'in', ambiguous_packages)
+            | list
+          }}
+        major_version_blocked_details: >-
+          {{
+            all_pending
+            | selectattr('name', 'in', major_version_blocked_packages)
             | list
           }}
       when: not (no_targets_given | bool)
@@ -1151,14 +1381,16 @@
           - "Host                    : {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
           - "Execution Mode          : {{ 'SCAN ONLY' if (dry_run | bool) else 'APPLIED' }}"
           - ""
-          - "1. Application Packages Found         : {{ matched_packages | default([]) | length }}"
-          - "2. Application Packages Installed     : {{ application_packages_installed }}"
-          - "3. Installation Status                : {{ installation_status }}"
-          - "4. Reboot Required                    : {{ 'YES' if (reboot_required | default(false)) else 'NO' }}"
+          - "1. Application Packages Found          : {{ matched_packages | default([]) | length }}"
+          - "2. Application Packages Installed      : {{ application_packages_installed }}"
+          - "3. Installation Status                 : {{ installation_status }}"
+          - "4. Reboot Required                     : {{ 'YES' if (reboot_required | default(false)) else 'NO' }}"
           - "5. Install Error                       : {{ install_error if install_error else '(none)' }}"
           - "6. Scan Error                          : {{ scan_error if scan_error else '(none)' }}"
-          - "7. OS Packages Left Untouched          : {{ (all_pending | default([]) | length) - (matched_packages | default([]) | length) }}"
-          - "8. Ambiguous Packages (review these)   : {{ classification_ambiguous_left_as_os | default([]) | length }}"
+          - "7. OS Packages Left Untouched           : {{ (all_pending | default([]) | length) - (matched_packages | default([]) | length) }}"
+          - "8. Ambiguous Packages (review these)    : {{ classification_ambiguous_left_as_os | default([]) | length }}"
+          - "9. Major-Version-Blocked (review these) : {{ major_version_blocked_details | default([]) | length }}"
+          - "10. Dependency-Conflict Packages (review): {{ dependency_conflict_packages | default([]) | length }}"
           - "============================================================"
       when: not (no_targets_given | bool)
 
@@ -1188,24 +1420,50 @@
         - not (no_targets_given | bool)
         - (classification_ambiguous_left_as_os | default([]) | length) > 0
 
+    - name: "Major-version-blocked packages — review for major_version_bump_allowlist"
+      debug:
+        msg: >-
+          {{ item.name }}: {{ item.current_version }} -> {{ item.new_version }}
+          [pkg_mgr={{ item.package_manager }}, repo={{ item.repository }} ({{ item.repository_type }})]
+          — application, but crosses a major version boundary; not installed.
+      loop: "{{ major_version_blocked_details | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - not (no_targets_given | bool)
+        - (major_version_blocked_details | default([]) | length) > 0
+
+    - name: "Dependency-conflict packages — would drag in a floored OS package, not installed"
+      debug:
+        msg: >-
+          {{ item }} — appeared as a collateral change in a simulated install
+          of an application package batch. Review repo pinning or the floor
+          list before allowing this batch to install.
+      loop: "{{ dependency_conflict_packages | default([]) }}"
+      when:
+        - not (no_targets_given | bool)
+        - (dependency_conflict_packages | default([]) | length) > 0
+
     - name: Store application patch report as a plain host fact (for aggregation)
       set_fact:
         application_apply_report_fact:
-          hostname:                  "{{ inventory_hostname }}"
-          skipped_no_targets:        "{{ no_targets_given | bool }}"
-          dry_run:                   "{{ dry_run | bool }}"
-          execution_mode:            "{{ 'SCAN ONLY' if (dry_run | bool) else 'APPLIED' }}"
+          hostname:                       "{{ inventory_hostname }}"
+          skipped_no_targets:             "{{ no_targets_given | bool }}"
+          dry_run:                        "{{ dry_run | bool }}"
+          execution_mode:                 "{{ 'SCAN ONLY' if (dry_run | bool) else 'APPLIED' }}"
           application_packages_found:     "{{ matched_packages | default([]) | length }}"
           application_packages_installed: "{{ application_packages_installed | default(0) }}"
-          installation_status:       "{{ installation_status | default('') }}"
-          application_patched:       "{{ application_patch_details | default([]) }}"
-          ambiguous_left_as_os:      "{{ classification_ambiguous_left_as_os | default([]) }}"
-          pending_left:              "{{ (all_pending | default([]) | length) - (matched_packages | default([]) | length) }}"
-          changed:                   "{{ (apply_changed_deb | default(false)) or (apply_changed_rh | default(false)) }}"
-          reboot_required:           "{{ reboot_required | default(false) }}"
-          reboot_done:               "{{ (reboot_if_required | bool) and (reboot_required | default(false) | bool) and not (dry_run | bool) }}"
-          install_error:             "{{ install_error }}"
-          scan_error:                "{{ scan_error }}"
+          installation_status:            "{{ installation_status | default('') }}"
+          application_patched:            "{{ application_patch_details | default([]) }}"
+          ambiguous_left_as_os:           "{{ classification_ambiguous_left_as_os | default([]) }}"
+          major_version_blocked:          "{{ major_version_blocked_details | default([]) }}"
+          dependency_conflict_packages:   "{{ dependency_conflict_packages | default([]) }}"
+          pending_left:                   "{{ (all_pending | default([]) | length) - (matched_packages | default([]) | length) }}"
+          changed:                        "{{ (apply_changed_deb | default(false)) or (apply_changed_rh | default(false)) }}"
+          reboot_required:                "{{ reboot_required | default(false) }}"
+          reboot_done:                    "{{ (reboot_if_required | bool) and (reboot_required | default(false) | bool) and not (dry_run | bool) }}"
+          install_error:                  "{{ install_error }}"
+          scan_error:                     "{{ scan_error }}"
 
     - name: Publish per-host application patch report to AWX job stats
       set_stats:
