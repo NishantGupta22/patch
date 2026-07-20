@@ -1,0 +1,1948 @@
+---
+# apply_operating_system_patches_awx.yml
+#
+# Self-contained AWX job: scans a host, identifies exactly which pending
+# updates are core OPERATING SYSTEM packages (kernel, systemd, glibc,
+# openssh, dpkg/rpm, bootloader, etc.) using package-metadata
+# classification, and installs ONLY those -- with SECURITY updates
+# excluded entirely (they belong to apply_security_patches_awx.yml) and
+# APPLICATION/middleware/third-party packages excluded entirely (they
+# belong to apply_application_patches_awx.yml).
+#
+# This is one of three intentionally-separate patch playbooks:
+#   apply_security_patches_awx.yml     -- security advisories only
+#   apply_operating_system_patches_awx.yml (this file) -- non-security OS only
+#   apply_application_patches_awx.yml  -- non-security application only
+# A package is patched by exactly one of the three, never more than one.
+#
+# ─────────────────────────────────────────────────────────────────────
+# FIX NOTES (review round 5) -- classification accuracy overhaul
+# ─────────────────────────────────────────────────────────────────────
+# Rounds 1-4 are unchanged and preserved below this block. Round 5
+# addresses a real false-negative problem reported after production use:
+# the classifier was under-catching genuine core-OS packages because it
+# leaned on a narrow Section/Priority allow-list and a hand-maintained
+# name list -- neither of which is an authoritative signal for "is this
+# the operating system." Section/Priority describe Debian packaging
+# taxonomy (which team maintains a package, what it depends on), not
+# semantic role, so metapackages and newer subsystems (snapd, nftables,
+# thermald, etc.) were being sorted by packaging convention rather than
+# by what they actually are.
+#
+# 22. [Debian] Added `Task:` field classification. This is tasksel's own
+#     authoritative record of which install task (ubuntu-server,
+#     ubuntu-server-minimal, ubuntu-minimal, ubuntu-standard, etc.) a
+#     package belongs to -- already present in `apt-cache show` output,
+#     it was simply never read. This is the correct fix for the
+#     metapackage/meta-tooling gap (ubuntu-minimal, ubuntu-server,
+#     ubuntu-server-minimal, ubuntu-standard, and everything Task-tagged
+#     under them) rather than trying to enumerate every such package by
+#     name.
+# 23. [Debian] Added `Protected:` field classification (dpkg >= 1.20.1),
+#     a broader modern successor to `Essential:` -- checked at the same
+#     tier.
+# 24. [Debian] Added Origin/Component classification. `apt-cache policy`
+#     is already called for version info; it is now also parsed for the
+#     archive component (main / restricted / universe / multiverse) of
+#     the candidate version. Priority=required/important/standard AND
+#     Component in {main, restricted} is a materially stronger "this is
+#     distro-maintained core software" signal than Section ever was,
+#     because Component reflects Canonical/Debian's own support
+#     commitment, not just packaging metadata -- kept as an additional
+#     path alongside (not a replacement for) the existing
+#     Priority+Section check.
+# 25. [Debian] Distro base metapackages (`ubuntu-*` / `debian-*` in
+#     `Section: metapackages`) are now classified as OS directly. These
+#     define what "the operating system" means on a given install and
+#     were previously invisible to every check in the classifier.
+# 26. [RHEL family] Added `dnf/dnf5 group info core|base|standard`
+#     membership classification, checked ahead of the `Group:` prefix
+#     heuristic. This is the direct RHEL/Fedora-comps equivalent of
+#     Debian's Task field -- an authoritative, distro-maintained list of
+#     what belongs to the base install, rather than inferring it from
+#     RPM Group strings (which, like Debian Section, describe packaging
+#     convention rather than role).
+# 27. Expanded the fallback core-OS name list with genuine OS-role
+#     packages that metadata alone was still missing on some hosts
+#     (firewall/network: nftables; storage: open-iscsi, sg3-utils,
+#     sg3-utils-udev; power/thermal: powermgmt-base, thermald; package
+#     management: snapd, software-properties-common,
+#     python3-software-properties; distro-info tooling used by system
+#     update machinery: python3-debian, python3-distro-info; hardware
+#     enablement: ubuntu-drivers-common; update infrastructure:
+#     update-notifier-common; diagnostics bundled with the base image:
+#     sosreport).
+# 28. Deliberately NOT added to the fallback list, despite being present
+#     and pending on some hosts: python3-attr, python3-tz,
+#     python3-packaging, tcpdump. These are either generic Python
+#     libraries (attrs, pytz, packaging) that ship widely as dependencies
+#     of both system tools and ordinary applications, or a general-purpose
+#     diagnostic utility (tcpdump) -- none of them define "the operating
+#     system," and classifying every library a system tool happens to
+#     depend on as OS would erode this playbook's core OS/application
+#     boundary rather than fix it. Any of the four can still be pinned
+#     to OS on a given fleet via os_classification_force_include if an
+#     operator disagrees for their environment.
+# ─────────────────────────────────────────────────────────────────────
+# FIX NOTES (review round 2-4) -- preserved from prior revisions
+# ─────────────────────────────────────────────────────────────────────
+#  1. dry_run / reboot_if_required are NO LONGER given defaults in the
+#     `vars:` block. AWX Survey answers (extra_vars) already win over
+#     play vars in Ansible's precedence, but to remove any ambiguity and
+#     make the Survey unambiguously own these two switches, they are
+#     resolved once, explicitly, near the top of the task list into
+#     effective_dry_run / effective_reboot_if_required via
+#     `{{ dry_run | default(true) | bool }}` and used everywhere after
+#     that -- the raw `dry_run` / `reboot_if_required` names are never
+#     read again past that point.
+#  2. Debian dry-run preview no longer relies on the `apt` module's
+#     check_mode (which can under-report changes on upgrade scenarios).
+#     Preview now runs the real preview tool operators actually trust:
+#     `apt-get -s install --only-upgrade <pkgs>` (apt's own simulate
+#     mode), captured and shown in the job output. Nothing is installed
+#     either way in dry-run mode.
+#  3. RHEL family dry-run preview no longer relies on the dnf/dnf5/yum
+#     module's check_mode for the same reason. Preview now runs
+#     `dnf upgrade --assumeno <pkgs>` (dnf/dnf5) or
+#     `yum update --assumeno <pkgs>` (yum) -- the same tool a human
+#     operator would run by hand to preview a transaction.
+#  4. Installation is no longer a single all-or-nothing module call.
+#     Packages are installed ONE AT A TIME in a loop with
+#     `ignore_errors: yes` on each iteration, so a dependency conflict
+#     or failure on one package can never block the rest -- the report
+#     below shows exactly which packages succeeded and which failed,
+#     per package, instead of "entire transaction failed".
+#  5. The playbook no longer assumes /usr/bin/python3 exists. Before
+#     copying the scanner script, it probes the target with the `raw`
+#     module (which needs no remote Python at all) for `python3` then
+#     `python`, and uses whichever is found to invoke the scanner. If
+#     neither exists, that host's scan is cleanly skipped and reported
+#     as a scan_error rather than the job blowing up.
+#  6. `apt-get update` now retries up to 3 times (10s delay) before
+#     falling through to the existing non-fatal warning.
+#  7. RHEL `makecache` gets the identical retry treatment.
+#  8. The scanner writes its JSON result straight to a report file on
+#     the target, which Ansible reads back with `slurp` -- stdout
+#     content plays no role in parsing.
+#  9. Package manager support is explicitly validated (apt / dnf / dnf5
+#     / yum only). Any other ansible_pkg_mgr is cleanly reported as an
+#     unsupported-package-manager scan_error.
+# 10. Reboot detection uses the authoritative OS-native check on both
+#     families.
+# 11. Every run writes a persistent, timestamped JSON snapshot to
+#     /var/log/patch_reports/ on the target host, plus a rolling
+#     history log.
+# 12. Removed a dead/broken task that referenced a non-existent Jinja
+#     filter.
+# 13. Install mode 'transaction_then_fallback' (default) installs every
+#     selected OS package together in one atomic transaction first, and
+#     only drops to per-package installs if that fails. Set to
+#     'per_package_only' to skip straight to per-package installs.
+# 14. Manual classification overrides via os_classification_force_include
+#     / os_classification_force_exclude.
+# 15. (reserved)
+# 16. ansible_date_time is refreshed from the target right before the
+#     report is built, instead of reusing the play-start timestamp.
+# 17. Per-package changed status on the transaction-success path is
+#     derived honestly by comparing pre/post-install versions queried
+#     from the package database, not from the module's single aggregate
+#     `changed` flag.
+# 18. PATCH EXECUTION SUMMARY output is numbered and dynamically
+#     labeled by mode (SCAN ONLY vs APPLY PATCHES).
+# 19. Fleet Execution Mode / Overall Result read from each host's own
+#     os_apply_report_fact.dry_run, never a second independent read of
+#     the raw dry_run extra_var.
+# 20. The per-host package listing is always shown; the fleet-wide
+#     numbered duplicate listing stays off by default
+#     (show_fleet_package_list).
+# 21. Fleet-wide Overall Result distinguishes PATCHED APPLIED / NO
+#     CHANGES NEEDED / COMPLETED WITH ERRORS in apply mode.
+#
+# AWX SURVEY (recommended fields -- exact JSON spec at the bottom of
+# this file): target_hosts (text), dry_run (boolean, default true),
+# reboot_if_required (boolean, default false). The Survey is the single
+# source of truth for dry_run / reboot_if_required on every run.
+#
+# CLASSIFICATION (is_os): metadata-driven, with authoritative
+# distro-membership signals checked ahead of packaging-taxonomy
+# heuristics --
+#   Debian/Ubuntu/Kali, in order:
+#     1. apt-cache show Essential: yes
+#     2. apt-cache show Protected: yes  (dpkg >= 1.20.1)
+#     3. apt-cache show Task: contains minimal/standard/server/core
+#        (tasksel's own record of base-install membership)
+#     4. Section: metapackages AND name matches ^(ubuntu|debian)-
+#        (distro base metapackages)
+#     5. Priority in {required,important,standard} AND Component
+#        (from apt-cache policy) in {main, restricted}
+#     6. Priority in {required,important,standard} AND Section in
+#        {admin,base,kernel,shells,boot}
+#   RHEL family, in order:
+#     1. Package name is a member of the `dnf/dnf5 group info
+#        core|base|standard` package set (repoquery/dnf group data,
+#        the distro's own base-install membership record)
+#     2. <mgr> repoquery --info: Group starting with "System
+#        Environment/Kernel" or "System Environment/Base" (the only two
+#        Group prefixes reliably OS-only -- broader groups like
+#        "System Environment/Daemons" or "...Libraries" are also used by
+#        application packages, so deliberately not treated as OS
+#        signals). Falls back to `rpm -qi` when repoquery is unavailable.
+# Only when all of the above are inconclusive does the scanner fall
+# back to a maintained core-OS package name list (kernel*, systemd*,
+# glibc, openssh*, dpkg/rpm/apt/yum/dnf, grub*, dracut, sudo, dbus,
+# cron*, NetworkManager, SELinux tooling, shadow-utils, the system
+# Python/Perl runtime itself, nftables, open-iscsi, sg3-utils, snapd,
+# thermald, and other genuine OS-role packages -- see FIX NOTE 27/28 for
+# what was deliberately included vs excluded and why). No generic
+# application library is ever added to that list purely because a
+# system tool happens to depend on it.
+#
+# SECURITY EXCLUSION: pending updates are cross-checked against the same
+# authoritative security-advisory source apply_security_patches_awx.yml
+# uses (Debian -security pocket via apt-cache madison; RHEL
+# `updateinfo list security`). Any package carrying a pending security
+# advisory is excluded here even if it is also a core OS package.
+#
+# FAILURE HANDLING: each package install is independently captured; the
+# whole apply block is additionally wrapped in block/rescue as a
+# defense-in-depth net for a truly unexpected error, so the
+# report/stats-publish steps always still run for this host.
+#
+# MAINTENANCE WINDOWS: `patch_serial` controls how many hosts are patched
+# concurrently (Ansible's `serial`). Defaults to '100%' -- override via
+# survey/extra_vars (e.g. 10, or '20%') to limit blast radius.
+#
+# Compatibility: Ubuntu/Debian/Kali (apt) and RHEL family
+# (dnf/yum/dnf5, including AlmaLinux/Rocky/Amazon Linux/Oracle Linux),
+# matching apply_security_patches_awx.yml.
+
+- name: Apply Operating System Patches Only (AWX)
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: yes
+  become: yes
+  serial: "{{ patch_serial | default('100%') }}"
+  vars:
+    remote_scanner: "/tmp/.os_patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
+    remote_scan_output: "/tmp/.os_patch_report_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.json"
+    reboot_timeout: 600
+    patch_scan_timeout: 1800
+    persistent_report_dir: /var/log/patch_reports
+    supported_pkg_managers: ['apt', 'dnf', 'dnf5', 'yum']
+    # dry_run / reboot_if_required deliberately NOT defaulted here --
+    # see FIX NOTE 1 above. They are resolved into effective_dry_run /
+    # effective_reboot_if_required by the first task below, and the
+    # Survey remains the single source of truth for both.
+    os_patch_install_mode: "transaction_then_fallback"
+    os_classification_force_include: []   # package names to always treat as OS, regardless of scanner result
+    os_classification_force_exclude: []   # package names to always exclude from OS, regardless of scanner result
+
+  tasks:
+
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 1 -- resolve Survey-controlled switches ONCE, explicitly.
+    # Every later task reads effective_dry_run / effective_reboot_if_required,
+    # never the raw dry_run / reboot_if_required names.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Resolve dry_run and reboot_if_required from Survey/extra_vars (Survey is authoritative)
+      set_fact:
+        effective_dry_run: "{{ dry_run | default(true) | bool }}"
+        effective_reboot_if_required: "{{ reboot_if_required | default(false) | bool }}"
+
+    - name: Initialize scan results and per-package tracking
+      set_fact:
+        all_patches: []
+        scan_error: ""
+        os_packages: []
+        install_error: ""
+        package_install_results: []
+        any_changed: false
+
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 9 -- explicitly validate the package manager is one this
+    # playbook actually supports, instead of silently mis-behaving on
+    # zypper/pacman/etc.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Validate package manager is supported (apt / dnf / dnf5 / yum only)
+      set_fact:
+        scan_error: >-
+          Unsupported package manager '{{ ansible_pkg_mgr | default('unknown') }}' on
+          {{ inventory_hostname }} — this playbook supports apt, dnf, dnf5, yum only
+          (e.g. zypper/pacman are not supported).
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - (ansible_pkg_mgr | default('unknown')) not in supported_pkg_managers
+
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 5 -- detect a usable Python interpreter with `raw` (which
+    # needs no remote Python itself) before we try to copy/run our
+    # scanner. Minimal images sometimes ship only `python3`, sometimes
+    # only `python`, sometimes neither.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Detect available Python interpreter on the target (raw — no remote Python required)
+      raw: command -v python3 || command -v python || echo NONE
+      register: python_bin_check
+      changed_when: false
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - (scan_error | default('')) == ""
+
+    - name: Set scanner interpreter path from detection result
+      set_fact:
+        patch_scanner_python: >-
+          {{ (python_bin_check.stdout_lines | default([]) | select('match', '^/.*') | list | first) | default('', true) }}
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - (scan_error | default('')) == ""
+
+    - name: Abort scan on this host if no Python interpreter was found
+      set_fact:
+        scan_error: "No python3 or python interpreter found on {{ inventory_hostname }} — cannot run patch scanner."
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - (scan_error | default('')) == ""
+        - (patch_scanner_python | default('')) == ""
+
+    # ───────────────────────────────────────────────────────────────────
+    # Refresh package metadata so classification is accurate.
+    # FIX NOTE 6/7 -- both refreshes now retry transient failures instead
+    # of accepting the first failed attempt.
+    # (metadata sync only -- never installs/upgrades anything)
+    # ───────────────────────────────────────────────────────────────────
+    - name: "[Debian] Refresh apt cache (retries on transient mirror failures)"
+      shell: |
+        set -o pipefail
+        apt-get update
+      args:
+        executable: /bin/bash
+      environment: { LC_ALL: C, LANG: C }
+      changed_when: false
+      failed_when: false
+      register: apt_update_result
+      until: apt_update_result.rc == 0
+      retries: 3
+      delay: 10
+      timeout: "{{ patch_scan_timeout }}"
+      when:
+        - ansible_os_family == "Debian"
+        - (scan_error | default('')) == ""
+
+    - name: "[Debian] Warn (non-fatal) if any repo failed to refresh after retries"
+      debug:
+        msg: >-
+          apt-get update reported errors on {{ inventory_hostname }} after 3 attempts — scan
+          will continue using whatever repos did refresh.
+          {{ (apt_update_result.stderr | default('') + ' ' + apt_update_result.stdout | default(''))
+             | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined
+        - apt_update_result.rc != 0
+
+    - name: "[RedHat] Refresh package metadata (retries on transient mirror failures)"
+      shell: |
+        set -e
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q makecache
+      args:
+        executable: /bin/bash
+      environment: { LC_ALL: C, LANG: C }
+      changed_when: false
+      failed_when: false
+      register: rh_makecache
+      until: rh_makecache.rc == 0
+      retries: 3
+      delay: 10
+      timeout: "{{ patch_scan_timeout }}"
+      when:
+        - ansible_os_family == "RedHat"
+        - (scan_error | default('')) == ""
+
+    - name: "[RedHat] Warn (non-fatal) if metadata refresh failed after retries"
+      debug:
+        msg: >-
+          makecache reported errors on {{ inventory_hostname }} after 3 attempts — scan will
+          continue using whatever repos did refresh.
+          {{ (rh_makecache.stderr | default('') + ' ' + rh_makecache.stdout | default(''))
+             | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined
+        - rh_makecache.rc != 0
+
+    # ───────────────────────────────────────────────────────────────────
+    # Scan -- classifies every pending update as is_security (excluded)
+    # and is_os (selected here) using package metadata. Never installs or
+    # modifies anything by itself.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Scan and apply operating-system-only patches
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - (scan_error | default('')) == ""
+      block:
+
+        - name: Copy patch scanner script to remote host
+          copy:
+            dest: "{{ remote_scanner }}"
+            mode: "0700"
+            content: |
+              {% raw %}
+              #!/usr/bin/env python3
+              """
+              patch_scanner.py -- shared classification engine used by
+              apply_operating_system_patches_awx.yml and
+              apply_application_patches_awx.yml.
+
+              For every pending update on the host this determines:
+                is_security -- same authoritative logic as
+                               apply_security_patches_awx.yml (Debian:
+                               -security pocket via apt-cache madison;
+                               RHEL: dnf/yum/dnf5 `updateinfo list
+                               security` advisory membership). Used here
+                               only to EXCLUDE packages, never to select
+                               them -- security updates belong to the
+                               other playbook.
+                is_os       -- whether the package is a core Operating
+                               System component (kernel, systemd, glibc,
+                               openssh, dpkg/rpm, bootloader, etc.) as
+                               opposed to application/middleware/
+                               third-party software.
+
+              Classification order (see FIX NOTES 22-28 for the review
+              round 5 rationale):
+                Debian/Ubuntu/Kali:
+                  1. Essential: yes
+                  2. Protected: yes (dpkg >= 1.20.1)
+                  3. Task: contains minimal/standard/server/core
+                     (tasksel's own base-install membership record)
+                  4. Section: metapackages AND name matches
+                     ^(ubuntu|debian)- (distro base metapackages)
+                  5. Priority in {required,important,standard} AND
+                     Component (from apt-cache policy) in
+                     {main, restricted}
+                  6. Priority in {required,important,standard} AND
+                     Section in {admin,base,kernel,shells,boot}
+                  7. Fallback core-OS name list
+                RHEL family:
+                  1. Membership in `dnf/dnf5 group info
+                     core|base|standard` (repoquery/dnf group data,
+                     itself the distro's authoritative base-install
+                     record)
+                  2. repoquery --info Group starting with "System
+                     Environment/Kernel" or "...Base". Falls back to
+                     `rpm -qi` on the installed package when repoquery
+                     is unavailable (plain yum without dnf-utils).
+                  3. Fallback core-OS name list
+
+              Result is written as JSON to the output file path given as
+              argv[3] (never relies on stdout being clean for parsing --
+              see FIX NOTE 8 in the calling playbook). Falls back to
+              printing to stdout only if no output path was given. Never
+              installs or modifies anything; always exits 0.
+              """
+              import json, os, re, shutil, subprocess, sys
+
+              ARCH_SUFFIX_RE = re.compile(
+                  r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
+              )
+
+              def run(cmd, timeout=180):
+                  try:
+                      proc = subprocess.run(cmd, capture_output=True, text=True,
+                                             timeout=timeout, errors="replace")
+                      return proc.returncode, proc.stdout, proc.stderr
+                  except FileNotFoundError:
+                      return 127, "", "command not found"
+                  except subprocess.TimeoutExpired:
+                      return 124, "", "timed out"
+                  except Exception as exc:
+                      return 1, "", str(exc)
+
+              # ── Fallback core-OS package classification ────────────
+              # Consulted only when metadata AND the distro-authoritative
+              # membership checks above are all inconclusive. Deliberately
+              # name/prefix based rather than broad category based -- e.g.
+              # "python3-" is NOT matched wholesale, because that would
+              # wrongly classify application Python packages
+              # (python3-requests, python3-pip, python3-attr, python3-tz,
+              # python3-packaging, ...) as Operating System. Only the
+              # system runtime itself, and specific system-tooling
+              # libraries that are themselves part of the distro's own
+              # package-management/update machinery (python3-debian,
+              # python3-distro-info, python3-software-properties), are
+              # matched. Generic libraries that merely happen to be
+              # dependencies of a system tool (attrs, pytz, packaging) are
+              # deliberately excluded -- see FIX NOTE 28. tcpdump is also
+              # deliberately excluded: it is a general-purpose diagnostic
+              # utility, not a component that defines the operating
+              # system. Any of these can be pinned to OS via
+              # os_classification_force_include if an operator disagrees
+              # for their environment.
+              OS_NAME_PATTERNS = [re.compile(p) for p in [
+                  r'^kernel($|-)', r'^linux-image', r'^linux-headers', r'^linux-modules',
+                  r'^linux-firmware$', r'^linux-base$',
+                  r'^systemd($|-)', r'^glibc($|-)', r'^libc6($|-)', r'^libc-bin$', r'^libc6-dev$',
+                  r'^bash$', r'^dash$', r'^coreutils$',
+                  r'^util-linux($|-)', r'^filesystem$', r'^setup$', r'^basesystem$', r'^base-files$',
+                  r'^sudo$', r'^openssh($|-server$|-client$)',
+                  r'^dbus($|-)', r'^cron$', r'^cronie$', r'^anacron$',
+                  r'^networkmanager($|-)', r'^network-manager($|-)', r'^netplan\.io$',
+                  r'^selinux-policy($|-)', r'^policycoreutils($|-)', r'^libselinux($|-)',
+                  r'^shadow-utils$', r'^passwd$', r'^login$', r'^login\.defs$',
+                  r'^grub2?($|-)', r'^grub-pc($|-)', r'^grub-efi($|-)', r'^shim($|-)',
+                  r'^initramfs-tools($|-)', r'^dracut($|-)',
+                  r'^rpm($|-libs$|-build-libs$)', r'^dpkg($|-dev$)', r'^apt($|-utils$)',
+                  r'^yum($|-utils$)', r'^dnf5?($|-plugins.*)?$',
+                  r'^python3$', r'^python3-minimal$', r'^python3\.\d+(-minimal)?$',
+                  r'^perl$', r'^perl-base$', r'^perl-libs$', r'^perl-interpreter$',
+                  r'^e2fsprogs$', r'^xfsprogs$', r'^mount$', r'^udev$', r'^systemd-udev$',
+                  r'^ncurses-base$', r'^ncurses-libs$', r'^readline($|-)', r'^zlib$', r'^zlib1g($|-)',
+                  r'^gnupg2?$', r'^ca-certificates$',
+                  r'^kali-archive-keyring$',
+                  r'^systemd-resolved$', r'^systemd-timesyncd$', r'^systemd-oomd$',
+                  r'^fwupd($|-)', r'^linux-tools-common$', r'^linux-tools-\d',
+                  r'^polkit($|d$)', r'^logrotate$', r'^rsyslog$',
+                  r'.*-release$',
+                  # -- added round 5 (see FIX NOTE 27) --
+                  r'^nftables$', r'^iptables$', r'^ebtables$',
+                  r'^open-iscsi$',
+                  r'^powermgmt-base$', r'^thermald$',
+                  r'^sg3-utils($|-udev$)',
+                  r'^snapd$',
+                  r'^software-properties-common$', r'^python3-software-properties$',
+                  r'^python3-debian$', r'^python3-distro-info$',
+                  r'^ubuntu-drivers-common$',
+                  r'^update-notifier-common$',
+                  r'^sosreport$',
+                  r'^ubuntu-(minimal|server|server-minimal|standard)$',
+                  r'^debian-(minimal|standard)$',
+              ]]
+
+              def name_matches_os_fallback(name):
+                  return any(p.match(name) for p in OS_NAME_PATTERNS)
+
+              # Debian Section values that indicate core OS territory.
+              # Combined with Priority so an "admin"-section tool that
+              # happens to be optional third-party software doesn't get
+              # swept in. Kept as a tertiary signal, behind Task and
+              # Component checks -- see classify_os_debian.
+              CORE_DEBIAN_SECTIONS = {'admin', 'base', 'kernel', 'shells', 'boot'}
+              CORE_DEBIAN_PRIORITIES = {'required', 'important', 'standard'}
+              # Archive components Debian/Ubuntu themselves maintain and
+              # support as part of the base distribution (as opposed to
+              # universe/multiverse, which are community/unsupported).
+              CORE_DEBIAN_COMPONENTS = {'main', 'restricted'}
+              # Task substrings that mark base-install membership.
+              CORE_DEBIAN_TASK_SUBSTRINGS = ('minimal', 'standard', 'server', 'core')
+
+              # RHEL rpm Group prefixes that are reliably core-OS-only in
+              # practice. Deliberately narrow: broader groups like
+              # "System Environment/Daemons" or "...Libraries" are also
+              # used by application packages (e.g. httpd, database
+              # client libraries) under common RPM spec conventions, so
+              # they are NOT treated as OS signals here -- dnf group
+              # membership and name-based fallback cover the genuine OS
+              # daemons/libraries instead.
+              CORE_RHEL_GROUP_PREFIXES = ('system environment/kernel', 'system environment/base')
+              CORE_RHEL_COMPS_GROUPS = ('core', 'base', 'standard')
+
+              # ── Debian classification ───────────────────────────────
+              def get_apt_show_fields(pkgs):
+                  """Batched `apt-cache show` parse ->
+                  {pkg: {Section, Priority, Essential, Protected, Task,
+                  Source}}. A package can have multiple stanzas (multiple
+                  versions/origins); the first stanza for a given name is
+                  used, matching apt-cache's own candidate precedence.
+                  All "Key: value" fields present in the stanza are kept
+                  generically, so Task/Protected need no special-case
+                  parsing beyond being read out of the dict afterwards."""
+                  if not pkgs:
+                      return {}
+                  rc, out, _ = run(["apt-cache", "show", *pkgs], timeout=120)
+                  fields_by_pkg = {}
+                  cur = {}
+                  for line in out.splitlines():
+                      if not line.strip():
+                          name = cur.get("Package")
+                          if name and name not in fields_by_pkg:
+                              fields_by_pkg[name] = cur
+                          cur = {}
+                          continue
+                      if ":" in line and not line.startswith(" "):
+                          k, _, v = line.partition(":")
+                          cur[k.strip()] = v.strip()
+                  if cur.get("Package") and cur["Package"] not in fields_by_pkg:
+                      fields_by_pkg[cur["Package"]] = cur
+                  return fields_by_pkg
+
+              def classify_os_debian(name, fields):
+                  essential = (fields.get("Essential", "") or "").strip().lower() == "yes"
+                  if essential:
+                      return True, "apt Essential: yes"
+
+                  protected = (fields.get("Protected", "") or "").strip().lower() == "yes"
+                  if protected:
+                      return True, "apt Protected: yes"
+
+                  task = (fields.get("Task", "") or "").strip().lower()
+                  if task and any(t in task for t in CORE_DEBIAN_TASK_SUBSTRINGS):
+                      return True, "apt Task=%s" % fields.get("Task")
+
+                  section = (fields.get("Section", "") or "").strip().lower().split("/")[-1]  # strip component prefix
+                  if section == "metapackages" and re.match(r"^(ubuntu|debian)-", name):
+                      return True, "distro base metapackage (Section=metapackages)"
+
+                  priority = (fields.get("Priority", "") or "").strip().lower()
+                  component = (fields.get("_component", "") or "").strip().lower()
+                  if priority in CORE_DEBIAN_PRIORITIES and component in CORE_DEBIAN_COMPONENTS:
+                      return True, "apt Priority=%s Component=%s" % (priority, component)
+                  if priority in CORE_DEBIAN_PRIORITIES and section in CORE_DEBIAN_SECTIONS:
+                      return True, "apt Priority=%s Section=%s" % (priority, section)
+
+                  source = (fields.get("Source", "") or name).split(" ")[0]
+                  if name_matches_os_fallback(name) or name_matches_os_fallback(source):
+                      return True, "fallback core-OS package list"
+                  return False, "not classified as core OS by metadata or fallback list"
+
+              # ── RHEL classification ─────────────────────────────────
+              def get_repoquery_fields(mgr, pkgs):
+                  """Batched `<mgr> repoquery --info` (dnf/dnf5) ->
+                  {pkg: {Group, Vendor, 'Source RPM'}}. Returns {} if
+                  repoquery is unavailable (plain yum without
+                  dnf-utils) -- caller falls back to `rpm -qi` on the
+                  installed package in that case."""
+                  if not pkgs:
+                      return {}
+                  rc, out, _ = run([mgr, "-q", "repoquery", "--info", *pkgs], timeout=180)
+                  if rc != 0 or not out.strip():
+                      return {}
+                  fields_by_pkg = {}
+                  cur = {}
+                  for line in out.splitlines():
+                      if not line.strip():
+                          name = cur.get("Name")
+                          if name and name not in fields_by_pkg:
+                              fields_by_pkg[name] = cur
+                          cur = {}
+                          continue
+                      if ":" in line:
+                          k, _, v = line.partition(":")
+                          cur[k.strip()] = v.strip()
+                  if cur.get("Name") and cur["Name"] not in fields_by_pkg:
+                      fields_by_pkg[cur["Name"]] = cur
+                  return fields_by_pkg
+
+              def get_rpm_qi_fields(pkgs):
+                  """Fallback per-package `rpm -qi <installed pkg>`
+                  lookup (Group, Vendor, Source RPM), used only when
+                  repoquery is unavailable on the host."""
+                  fields_by_pkg = {}
+                  for pkg in pkgs:
+                      rc, out, _ = run(["rpm", "-qi", pkg], timeout=15)
+                      if rc != 0:
+                          continue
+                      f = {}
+                      for line in out.splitlines():
+                          if ":" in line:
+                              k, _, v = line.partition(":")
+                              k = k.strip()
+                              if k in ("Group", "Vendor", "Source RPM"):
+                                  f[k] = v.strip()
+                      if f:
+                          fields_by_pkg[pkg] = f
+                  return fields_by_pkg
+
+              def get_rhel_core_group_packages(mgr):
+                  """Package names belonging to the `core`, `base`, or
+                  `standard` comps groups -- dnf/dnf5's own authoritative
+                  record of base-install membership, the direct RHEL
+                  equivalent of Debian's Task field. Returns an empty set
+                  (never raises) if `group info` isn't supported/available
+                  on this host -- callers simply fall through to the next
+                  classification tier in that case."""
+                  names = set()
+                  for group in CORE_RHEL_COMPS_GROUPS:
+                      rc, out, _ = run([mgr, "-q", "group", "info", group], timeout=60)
+                      if rc != 0 or not out.strip():
+                          continue
+                      in_pkgs = False
+                      for line in out.splitlines():
+                          s = line.strip()
+                          if re.match(r"^(Mandatory|Default|Optional|Conditional) Packages:?$", s, re.I):
+                              in_pkgs = True
+                              continue
+                          if not s:
+                              in_pkgs = False
+                              continue
+                          if in_pkgs:
+                              names.add(s.lstrip("+- ").strip())
+                  return names
+
+              def classify_os_redhat(name, fields, core_group_names=None):
+                  core_group_names = core_group_names or set()
+                  if name in core_group_names:
+                      return True, "dnf group core/base/standard membership"
+
+                  group = (fields.get("Group", "") or "").strip().lower()
+                  if group.startswith(CORE_RHEL_GROUP_PREFIXES):
+                      return True, "rpm Group=%s" % fields.get("Group")
+
+                  source_rpm = fields.get("Source RPM", fields.get("Source", "")) or name
+                  source_name = ARCH_SUFFIX_RE.sub("", re.sub(r"-[^-]+-[^-]+$", "", source_rpm)) if source_rpm else name
+                  if name_matches_os_fallback(name) or name_matches_os_fallback(source_name):
+                      return True, "fallback core-OS package list"
+                  return False, "not classified as core OS by metadata or fallback list"
+
+              # ── shared: pending-update discovery + security check ──
+              def parse_check_update(text):
+                  SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Loading mirror", "Security:", "Added Packages")
+                  SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Za-z ]+Packages\s*:?$")
+                  in_obsoleting, pkgs = False, []
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+                      if re.match(r"^Obsoleting", line, re.I):
+                          in_obsoleting = True
+                          continue
+                      if SECTION_HEADER_RE.match(line):
+                          in_obsoleting = False
+                          continue
+                      if in_obsoleting or any(line.startswith(p) for p in SKIP_PREFIXES):
+                          continue
+                      if re.match(r"^[=\-\*]+$", line):
+                          continue
+                      parts = line.split()
+                      if len(parts) < 2:
+                          continue
+                      name = ARCH_SUFFIX_RE.sub("", parts[0])
+                      if not name or re.match(r"^\d", name):
+                          continue
+                      pkgs.append(name)
+                  return sorted(set(pkgs))
+
+              def parse_pkg_info(text, only_section=None):
+                  result, block, cur_key, cur_section = {}, {}, None, None
+                  def header_kind(line):
+                      h = line.strip().lower().rstrip(":").strip()
+                      if h == "installed packages": return "installed"
+                      if h == "available packages": return "available"
+                      return None
+                  for line in text.splitlines():
+                      kind = header_kind(line)
+                      if kind:
+                          cur_section = kind
+                          continue
+                      if not line.strip():
+                          if "Name" in block and (only_section is None or cur_section == only_section):
+                              result.setdefault(block["Name"], block)
+                          block, cur_key = {}, None
+                          continue
+                      if line[:1] in (" ", "\t") and cur_key:
+                          block[cur_key] = (block.get(cur_key, "") + " " + line.strip()).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          block[key] = val
+                          cur_key = key
+                  if "Name" in block and (only_section is None or cur_section == only_section):
+                      result.setdefault(block["Name"], block)
+                  return result
+
+              def strip_nevra(nevra):
+                  name = ARCH_SUFFIX_RE.sub("", nevra)
+                  parts = name.rsplit("-", 2)
+                  return parts[0] if len(parts) == 3 else name
+
+              def get_apt_policy(pkgs):
+                  """Batched `apt-cache policy` parse ->
+                  {pkg: {installed, candidate, component}}. component is
+                  the archive component (main/restricted/universe/
+                  multiverse) associated with the *candidate* version's
+                  version-table entry (the line(s) directly under the
+                  '***'-marked candidate line), used as an additional
+                  classification signal in classify_os_debian (FIX NOTE
+                  24) -- left as '' if it can't be determined, which
+                  simply means that signal is skipped for this package."""
+                  if not pkgs:
+                      return {}
+                  rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
+                  result, cur_pkg = {}, None
+                  in_candidate_block = False
+                  component_re = re.compile(r"\s\S+/(main|restricted|universe|multiverse)\b")
+                  for line in out.splitlines():
+                      m = re.match(r"^(\S+):$", line)
+                      if m:
+                          cur_pkg = m.group(1)
+                          result[cur_pkg] = {"installed": "unknown", "candidate": "unknown", "component": ""}
+                          in_candidate_block = False
+                          continue
+                      if not cur_pkg:
+                          continue
+                      mi = re.match(r"\s+Installed:\s+(\S+)", line)
+                      mc = re.match(r"\s+Candidate:\s+(\S+)", line)
+                      if mi:
+                          v = mi.group(1)
+                          result[cur_pkg]["installed"] = "" if v == "(none)" else v
+                          continue
+                      if mc:
+                          v = mc.group(1)
+                          result[cur_pkg]["candidate"] = "" if v == "(none)" else v
+                          continue
+                      if line.strip().startswith("***"):
+                          in_candidate_block = True
+                          cm = component_re.search(line)
+                          if cm and not result[cur_pkg]["component"]:
+                              result[cur_pkg]["component"] = cm.group(1)
+                          continue
+                      if in_candidate_block:
+                          if re.match(r"^\s{6,}\d+\s", line):
+                              cm = component_re.search(line)
+                              if cm and not result[cur_pkg]["component"]:
+                                  result[cur_pkg]["component"] = cm.group(1)
+                          elif re.match(r"^\s*\d+\s+\S", line):
+                              # a differently-versioned version-table entry begins; stop
+                              # attributing component lines to the candidate block
+                              in_candidate_block = False
+                  return result
+
+              def scan_debian(distro=""):
+                  is_kali = distro.lower() == "kali"
+                  rc, out, _ = run(
+                      ["apt-get", "-s", "dist-upgrade", "-o", "Debug::NoLocking=true"],
+                      timeout=300,
+                  )
+                  pkgs = sorted({l.split()[1] for l in out.splitlines()
+                                 if l.startswith("Inst ") and len(l.split()) > 1})
+                  if not pkgs:
+                      return []
+
+                  policy = get_apt_policy(pkgs)
+                  show_fields = get_apt_show_fields(pkgs)
+
+                  madison = {}
+                  if not is_kali:
+                      _, madison_out, _ = run(["apt-cache", "madison", *pkgs], timeout=60)
+                      for line in madison_out.splitlines():
+                          cols = [c.strip() for c in line.split("|")]
+                          if len(cols) >= 3:
+                              madison.setdefault(cols[0], []).append((cols[1], cols[2]))
+
+                  results = []
+                  for pkg in pkgs:
+                      pol = policy.get(pkg, {})
+                      cur_ver = pol.get("installed", "unknown") or "unknown"
+                      new_ver = pol.get("candidate", "unknown") or "unknown"
+
+                      is_security = (not is_kali) and any(
+                          "-security" in src and (new_ver in ("unknown", "") or ver == new_ver)
+                          for ver, src in madison.get(pkg, [])
+                      )
+
+                      fields = dict(show_fields.get(pkg, {}))
+                      fields["_component"] = pol.get("component", "")
+                      is_os, os_reason = classify_os_debian(pkg, fields)
+
+                      results.append({
+                          "name": pkg, "current_version": cur_ver, "new_version": new_ver,
+                          "is_security": is_security, "is_os": is_os, "classification": os_reason,
+                      })
+                  return results
+
+              def get_security_package_names(mgr):
+                  """Package names carrying a pending security advisory
+                  (same source list apply_security_patches_awx.yml
+                  classifies from) -- used here only to EXCLUDE them,
+                  never to select them."""
+                  _, out, _ = run([mgr, "-q", "updateinfo", "list", "security", "--available"], timeout=180)
+                  names = set()
+                  for raw in out.splitlines():
+                      parts = raw.split()
+                      if len(parts) < 3:
+                          continue
+                      name = strip_nevra(parts[-1])
+                      if name:
+                          names.add(name)
+                  return names
+
+              def scan_redhat(distro="", pkg_mgr=""):
+                  # Prefer the package manager Ansible itself detected
+                  # (passed in as pkg_mgr) so the scan and the actual
+                  # apply always agree on which binary is authoritative.
+                  # Only fall back to independent detection if the caller
+                  # didn't supply one, or the supplied one isn't present.
+                  mgr = shutil.which(pkg_mgr) if pkg_mgr else None
+                  if not mgr:
+                      mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
+                  if not mgr:
+                      return []
+
+                  rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
+                  if rc not in (0, 100):
+                      return []
+                  pkgs = parse_check_update(out)
+                  if not pkgs:
+                      return []
+
+                  _, avail_out, _ = run([mgr, "-q", "info", *pkgs], timeout=180)
+                  avail = parse_pkg_info(avail_out, only_section="available")
+                  _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
+                  installed = parse_pkg_info(inst_out, only_section="installed")
+
+                  security_names = get_security_package_names(mgr)
+
+                  repoquery_fields = get_repoquery_fields(mgr, pkgs)
+                  missing = [p for p in pkgs if p not in repoquery_fields]
+                  if missing:
+                      repoquery_fields.update(get_rpm_qi_fields(missing))
+
+                  # FIX NOTE 26 -- authoritative comps-group membership,
+                  # queried once per run rather than per package.
+                  core_group_names = get_rhel_core_group_packages(mgr)
+
+                  def _fmt_version(info):
+                      ver, rel = info.get("Version", ""), info.get("Release", "")
+                      epoch = info.get("Epoch", "0")
+                      base = "%s-%s" % (ver, rel) if rel else (ver or "unknown")
+                      if base == "unknown":
+                          return base
+                      return ("%s:%s" % (epoch, base)) if epoch not in ("", "0") else base
+
+                  results = []
+                  for pkg in pkgs:
+                      a, i = avail.get(pkg, {}), installed.get(pkg, {})
+                      is_security = pkg in security_names
+                      fields = repoquery_fields.get(pkg, {})
+                      is_os, os_reason = classify_os_redhat(pkg, fields, core_group_names=core_group_names)
+                      results.append({
+                          "name": pkg,
+                          "current_version": _fmt_version(i),
+                          "new_version": _fmt_version(a),
+                          "is_security": is_security, "is_os": is_os, "classification": os_reason,
+                      })
+                  return results
+
+              def main():
+                  os_family = sys.argv[1] if len(sys.argv) > 1 else ""
+                  distro    = sys.argv[2] if len(sys.argv) > 2 else ""
+                  out_path  = sys.argv[3] if len(sys.argv) > 3 else ""
+                  pkg_mgr   = sys.argv[4] if len(sys.argv) > 4 else ""
+                  try:
+                      if os_family == "Debian":
+                          patches = scan_debian(distro=distro)
+                      elif os_family == "RedHat":
+                          patches = scan_redhat(distro=distro, pkg_mgr=pkg_mgr)
+                      else:
+                          patches = []
+                  except Exception:
+                      patches = []
+                  data = json.dumps(patches)
+                  if out_path:
+                      try:
+                          with open(out_path, "w") as f:
+                              f.write(data)
+                          return
+                      except Exception:
+                          pass
+                  print(data)
+
+              if __name__ == "__main__":
+                  main()
+              {% endraw %}
+
+        - name: Run patch scanner (writes JSON report to a file — see FIX NOTE 8)
+          command: >
+            {{ patch_scanner_python }}
+            {{ remote_scanner }}
+            {{ ansible_os_family }}
+            {{ ansible_distribution }}
+            {{ remote_scan_output }}
+            {{ ansible_pkg_mgr | default('') }}
+          register: scan_result
+          changed_when: false
+          failed_when: false
+          timeout: "{{ patch_scan_timeout }}"
+          environment:
+            LC_ALL: C
+            LANG: C
+
+        - name: Read scanner JSON report from file
+          slurp:
+            src: "{{ remote_scan_output }}"
+          register: scan_output_slurp
+          failed_when: false
+
+        - name: Parse patch scanner output
+          block:
+            - set_fact:
+                all_patches: "{{ (scan_output_slurp.content | b64decode) | from_json }}"
+          rescue:
+            - set_fact:
+                all_patches: []
+                scan_error: >-
+                  Patch scanner failed or produced no valid JSON report (rc={{ scan_result.rc | default('?') }}):
+                  {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
+                     | trim | truncate(300) }}
+
+        # ─────────────────────────────────────────────────────────────
+        # FIX NOTE 14 -- apply manual classification overrides (if any
+        # were supplied) before building the OS package list. Overrides
+        # only ever re-flag packages the scanner already found pending;
+        # they can't add a package that isn't actually pending an
+        # update, so this can never cause an unwanted install/downgrade.
+        # ─────────────────────────────────────────────────────────────
+        - name: Initialize override-applied patch list
+          set_fact:
+            all_patches_overridden: []
+          when: (os_classification_force_include | length) > 0 or (os_classification_force_exclude | length) > 0
+
+        - name: Apply manual OS classification overrides to scanner results
+          set_fact:
+            all_patches_overridden: "{{ all_patches_overridden + [ item | combine({'is_os': (true if item.name in os_classification_force_include else (false if item.name in os_classification_force_exclude else item.is_os)), 'classification': ('manual override: force_include' if item.name in os_classification_force_include else ('manual override: force_exclude' if item.name in os_classification_force_exclude else item.classification))}) ] }}"
+          loop: "{{ all_patches }}"
+          loop_control:
+            label: "{{ item.name }}"
+          when: (os_classification_force_include | length) > 0 or (os_classification_force_exclude | length) > 0
+
+        - name: Replace scanner results with override-applied version
+          set_fact:
+            all_patches: "{{ all_patches_overridden }}"
+          when: (os_classification_force_include | length) > 0 or (os_classification_force_exclude | length) > 0
+
+        - name: Build operating-system-only, non-security package list
+          set_fact:
+            os_packages: >-
+              {{
+                all_patches
+                | selectattr('is_security', 'equalto', false)
+                | selectattr('is_os', 'equalto', true)
+                | map(attribute='name') | list
+              }}
+
+        # ─────────────────────────────────────────────────────────────
+        # FIX NOTE 14 (cont.) -- flag anything the scanner only caught
+        # via the name-based fallback list rather than real package
+        # metadata. Still applied like any other OS package (fail-open
+        # here would mean leaving genuine OS packages unpatched), but
+        # surfaced clearly in the report so it gets a human glance —
+        # this is the honest way to push classification accuracy
+        # higher: catch the ambiguous cases instead of silently trusting
+        # them.
+        # ─────────────────────────────────────────────────────────────
+        - name: Flag OS packages classified via fallback name-matching (metadata was inconclusive)
+          set_fact:
+            low_confidence_os_packages: >-
+              {{
+                all_patches
+                | selectattr('name', 'in', os_packages)
+                | selectattr('classification', 'search', 'fallback')
+                | map(attribute='name') | list
+              }}
+
+        - name: Warn when selected OS packages were classified via fallback rather than metadata
+          debug:
+            msg: >-
+              {{ low_confidence_os_packages | length }} of {{ os_packages | length }} selected OS package(s) on
+              {{ inventory_hostname }} were classified via the fallback name list rather than package metadata:
+              {{ low_confidence_os_packages | join(', ') }}. Still applied like any other OS package, but worth a
+              quick manual check — especially on hosts using vendor/OEM or third-party repos, where metadata
+              conventions can differ from upstream Debian/RHEL. Use os_classification_force_exclude to override any
+              of these if they turn out to be misclassified.
+          when: (low_confidence_os_packages | length) > 0
+
+        - name: Report — nothing OS-related to patch on this host
+          debug:
+            msg: >-
+              {{ scan_error if scan_error else
+                 (all_patches | length) ~ ' pending update(s) on ' ~ inventory_hostname ~
+                 ', none classified as non-security Operating System packages. Nothing to do
+                 (application packages and security updates left untouched).' }}
+          when: (os_packages | length) == 0
+
+        # ─────────────────────────────────────────────────────────────
+        # Apply — ONLY the packages classified is_os=true AND
+        # is_security=false. Application packages and anything flagged
+        # security are deliberately never named here.
+        #
+        # FIX NOTE 2/3 -- dry-run preview uses each package manager's own
+        # real preview/simulate tool instead of module check_mode.
+        # FIX NOTE 13 -- installs are TRANSACTION-FIRST: every selected
+        # OS package is installed together in one atomic transaction
+        # (correct for interdependent sets like systemd/systemd-libs/
+        # systemd-pam or glibc/glibc-common/glibc-langpack, which the
+        # package manager needs to resolve as a unit). Only if that
+        # whole transaction fails does the playbook drop to the old
+        # one-package-at-a-time loop with ignore_errors, purely to
+        # isolate which specific package is the problem — outcome per
+        # package is recorded into package_install_results either way.
+        # Set os_patch_install_mode: per_package_only via survey/
+        # extra_vars to skip the transaction attempt entirely.
+        # The whole section keeps an outer block/rescue purely as a
+        # defense-in-depth net for a truly unexpected (non-per-package)
+        # failure, so the report/stats-publish steps below always run.
+        # ─────────────────────────────────────────────────────────────
+        - name: Apply operating system patches (transaction-first, per-package fallback)
+          block:
+
+            # ---- Debian dry-run preview (apt-get -s, real simulate) ----
+            - name: "[Debian] Preview pending OS updates (dry-run — apt-get -s simulate)"
+              shell: |
+                set -o pipefail
+                apt-get -s install --only-upgrade {{ os_packages | map('quote') | join(' ') }}
+              args:
+                executable: /bin/bash
+              environment: { LC_ALL: C, LANG: C }
+              register: apt_dryrun_preview
+              changed_when: false
+              failed_when: false
+              when:
+                - ansible_os_family == "Debian"
+                - effective_dry_run
+                - (os_packages | length) > 0
+
+            - name: "[Debian] Show dry-run simulate output (raw apt-get -s — verbose/debug only)"
+              debug:
+                var: apt_dryrun_preview.stdout_lines
+              when:
+                - ansible_os_family == "Debian"
+                - effective_dry_run
+                - (os_packages | length) > 0
+                - show_raw_dryrun_preview | default(false) | bool
+
+            # ---- Debian real apply: single transaction (primary path) ----
+            - name: "[Debian] Install all selected OS updates in a single transaction"
+              apt:
+                name: "{{ os_packages }}"
+                state: latest
+                update_cache: no
+                install_recommends: no
+              register: apt_transaction_result
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "Debian"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: "[Debian] Report transaction outcome"
+              debug:
+                msg: >-
+                  {{ ('Transaction succeeded — all ' ~ (os_packages | length) ~ ' package(s) applied together.')
+                     if not (apt_transaction_result.failed | default(false))
+                     else ('Transaction failed, falling back to per-package installs to isolate the failure: '
+                           ~ (apt_transaction_result.msg | default('see AWX job output'))) }}
+              when:
+                - ansible_os_family == "Debian"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            # ---- Debian real apply: one-package-at-a-time (fallback path) ----
+            - name: "[Debian] Install OS updates one package at a time (fallback / per_package_only mode)"
+              apt:
+                name: "{{ item }}"
+                state: latest
+                update_cache: no
+                install_recommends: no
+              register: apt_install_loop
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "Debian"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - (os_patch_install_mode == 'per_package_only') or (apt_transaction_result.failed | default(false))
+
+            # ---- RHEL family dry-run preview (--assumeno, real simulate) ----
+            - name: "[RedHat - dnf/dnf5] Preview pending OS updates (dry-run — --assumeno simulate)"
+              command: "{{ ansible_pkg_mgr }} upgrade --assumeno {{ os_packages | map('quote') | join(' ') }}"
+              register: dnf_dryrun_preview
+              changed_when: false
+              failed_when: false
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr in ['dnf', 'dnf5']
+                - effective_dry_run
+                - (os_packages | length) > 0
+
+            - name: "[RedHat - yum] Preview pending OS updates (dry-run — --assumeno simulate)"
+              command: "yum update --assumeno {{ os_packages | map('quote') | join(' ') }}"
+              register: yum_dryrun_preview
+              changed_when: false
+              failed_when: false
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "yum"
+                - effective_dry_run
+                - (os_packages | length) > 0
+
+            - name: "[RedHat] Show dry-run simulate output (raw dnf/yum --assumeno — verbose/debug only)"
+              debug:
+                var: (dnf_dryrun_preview.stdout_lines if (dnf_dryrun_preview is defined and not (dnf_dryrun_preview.skipped | default(false))) else yum_dryrun_preview.stdout_lines)
+              when:
+                - ansible_os_family == "RedHat"
+                - effective_dry_run
+                - (os_packages | length) > 0
+                - show_raw_dryrun_preview | default(false) | bool
+
+            # ---- RHEL family real apply: single transaction (primary path) ----
+            - name: "[RedHat - dnf5] Install all selected OS updates in a single transaction"
+              dnf5:
+                name: "{{ os_packages }}"
+                state: latest
+              register: rh_transaction_result_dnf5
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "dnf5"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: "[RedHat - dnf] Install all selected OS updates in a single transaction"
+              dnf:
+                name: "{{ os_packages }}"
+                state: latest
+              register: rh_transaction_result_dnf
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "dnf"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: "[RedHat - yum] Install all selected OS updates in a single transaction"
+              yum:
+                name: "{{ os_packages }}"
+                state: latest
+              register: rh_transaction_result_yum
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "yum"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: Merge RHEL transaction result (whichever of dnf5/dnf/yum actually ran)
+              set_fact:
+                rh_transaction_result: >-
+                  {{
+                    rh_transaction_result_dnf5 if (rh_transaction_result_dnf5 is defined and not (rh_transaction_result_dnf5.skipped | default(false)))
+                    else rh_transaction_result_dnf if (rh_transaction_result_dnf is defined and not (rh_transaction_result_dnf.skipped | default(false)))
+                    else rh_transaction_result_yum if (rh_transaction_result_yum is defined and not (rh_transaction_result_yum.skipped | default(false)))
+                    else {'failed': false, 'changed': false, 'skipped': true}
+                  }}
+              when:
+                - ansible_os_family == "RedHat"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: "[RedHat] Report transaction outcome"
+              debug:
+                msg: >-
+                  {{ ('Transaction succeeded — all ' ~ (os_packages | length) ~ ' package(s) applied together.')
+                     if not (rh_transaction_result.failed | default(false))
+                     else ('Transaction failed, falling back to per-package installs to isolate the failure: '
+                           ~ (rh_transaction_result.msg | default('see AWX job output'))) }}
+              when:
+                - ansible_os_family == "RedHat"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            # ---- RHEL family real apply: one-package-at-a-time (fallback path) ----
+            - name: "[RedHat - dnf5] Install OS updates one package at a time (fallback / per_package_only mode)"
+              dnf5:
+                name: "{{ item }}"
+                state: latest
+              register: rh_install_loop_dnf5
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "dnf5"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - (os_patch_install_mode == 'per_package_only') or (rh_transaction_result.failed | default(false))
+
+            - name: "[RedHat - dnf] Install OS updates one package at a time (fallback / per_package_only mode)"
+              dnf:
+                name: "{{ item }}"
+                state: latest
+              register: rh_install_loop_dnf
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "dnf"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - (os_patch_install_mode == 'per_package_only') or (rh_transaction_result.failed | default(false))
+
+            - name: "[RedHat - yum] Install OS updates one package at a time (fallback / per_package_only mode)"
+              yum:
+                name: "{{ item }}"
+                state: latest
+              register: rh_install_loop_yum
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              ignore_errors: yes
+              when:
+                - ansible_os_family == "RedHat"
+                - ansible_pkg_mgr == "yum"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - (os_patch_install_mode == 'per_package_only') or (rh_transaction_result.failed | default(false))
+
+            - name: Merge RHEL per-package install loop results (whichever of dnf5/dnf/yum actually ran)
+              set_fact:
+                rh_install_loop_results: >-
+                  {{
+                    (rh_install_loop_dnf5.results | default([]))
+                    + (rh_install_loop_dnf.results | default([]))
+                    + (rh_install_loop_yum.results | default([]))
+                  }}
+              when: ansible_os_family == "RedHat"
+
+            # ---- Build package_install_results: dry-run preview entries ----
+            - name: Record dry-run preview outcome per package (no install performed)
+              set_fact:
+                package_install_results: "{{ package_install_results + [{'name': item, 'status': 'preview', 'changed': false, 'error': ''}] }}"
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              when:
+                - effective_dry_run
+                - (os_packages | length) > 0
+
+            # ─────────────────────────────────────────────────────────
+            # FIX NOTE 17 -- a single multi-package apt/dnf/yum call only
+            # reports one aggregate `changed` for the whole transaction,
+            # not per package. To report per-package changed status
+            # honestly on the transaction-success path, compare each
+            # package's pre-install version (already known from the
+            # scan) against its actual post-install version queried
+            # straight from the package database.
+            # ─────────────────────────────────────────────────────────
+            - name: Initialize pre-install version lookup
+              set_fact:
+                pre_install_versions: {}
+              when:
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: Build pre-install version lookup (name -> version as scanned, before install)
+              set_fact:
+                pre_install_versions: "{{ pre_install_versions | combine({item.name: item.current_version}) }}"
+              loop: "{{ all_patches | selectattr('name', 'in', os_packages) | list }}"
+              loop_control:
+                label: "{{ item.name }}"
+              when:
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            - name: "[Debian] Query actual post-install versions (for accurate per-package changed detection)"
+              command: "dpkg-query -W -f='${Package} ${Version}\n' {{ os_packages | join(' ') }}"
+              register: apt_post_versions
+              changed_when: false
+              failed_when: false
+              when:
+                - ansible_os_family == "Debian"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+                - not (apt_transaction_result.failed | default(false))
+
+            - name: "[RedHat] Query actual post-install versions (for accurate per-package changed detection)"
+              command: "rpm -q --queryformat '%{NAME} %{VERSION}-%{RELEASE}\n' {{ os_packages | join(' ') }}"
+              register: rpm_post_versions
+              changed_when: false
+              failed_when: false
+              when:
+                - ansible_os_family == "RedHat"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+                - not (rh_transaction_result.failed | default(false))
+
+            - name: Build post-install version lookup (Debian and RHEL — epoch stripped from pre-install side for a consistent comparison)
+              set_fact:
+                post_install_versions: >-
+                  {{
+                    dict(
+                      ((apt_post_versions.stdout_lines | default([]))
+                       + (rpm_post_versions.stdout_lines | default([])))
+                      | select('search', ' ')
+                      | map('split', ' ')
+                    )
+                  }}
+              when:
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+
+            # ---- Build package_install_results: Debian transaction-succeeded entries (real per-package changed) ----
+            - name: Record Debian transaction outcome per package (transaction succeeded)
+              set_fact:
+                package_install_results: >-
+                  {{
+                    package_install_results + [{
+                      'name': item,
+                      'status': 'success',
+                      'changed': ((post_install_versions[item] | default('unknown')) != (pre_install_versions[item] | default('') | regex_replace('^[0-9]+:', ''))),
+                      'error': ''
+                    }]
+                  }}
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              when:
+                - ansible_os_family == "Debian"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+                - not (apt_transaction_result.failed | default(false))
+
+            # ---- Build package_install_results: Debian per-package fallback entries ----
+            - name: Record Debian per-package fallback outcome per package
+              set_fact:
+                package_install_results: >-
+                  {{
+                    package_install_results + [{
+                      'name': item.item,
+                      'status': ('failed' if (item.failed | default(false)) else 'success'),
+                      'changed': (item.changed | default(false)),
+                      'error': ((item.msg | default('unknown error')) if (item.failed | default(false)) else '')
+                    }]
+                  }}
+              loop: "{{ apt_install_loop.results | default([]) }}"
+              loop_control:
+                label: "{{ item.item | default('unknown') }}"
+              when:
+                - ansible_os_family == "Debian"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - (os_patch_install_mode == 'per_package_only') or (apt_transaction_result.failed | default(false))
+
+            # ---- Build package_install_results: RHEL transaction-succeeded entries (real per-package changed) ----
+            - name: Record RHEL transaction outcome per package (transaction succeeded)
+              set_fact:
+                package_install_results: >-
+                  {{
+                    package_install_results + [{
+                      'name': item,
+                      'status': 'success',
+                      'changed': ((post_install_versions[item] | default('unknown')) != (pre_install_versions[item] | default('') | regex_replace('^[0-9]+:', ''))),
+                      'error': ''
+                    }]
+                  }}
+              loop: "{{ os_packages }}"
+              loop_control:
+                label: "{{ item }}"
+              when:
+                - ansible_os_family == "RedHat"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - os_patch_install_mode != 'per_package_only'
+                - not (rh_transaction_result.failed | default(false))
+
+            # ---- Build package_install_results: RHEL per-package fallback entries ----
+            - name: Record RHEL per-package fallback outcome per package
+              set_fact:
+                package_install_results: >-
+                  {{
+                    package_install_results + [{
+                      'name': item.item,
+                      'status': ('failed' if (item.failed | default(false)) else 'success'),
+                      'changed': (item.changed | default(false)),
+                      'error': ((item.msg | default('unknown error')) if (item.failed | default(false)) else '')
+                    }]
+                  }}
+              loop: "{{ rh_install_loop_results | default([]) }}"
+              loop_control:
+                label: "{{ item.item | default('unknown') }}"
+              when:
+                - ansible_os_family == "RedHat"
+                - not effective_dry_run
+                - (os_packages | length) > 0
+                - (os_patch_install_mode == 'per_package_only') or (rh_transaction_result.failed | default(false))
+
+            - name: Determine if any package actually changed
+              set_fact:
+                any_changed: "{{ (package_install_results | selectattr('changed', 'equalto', true) | list | length) > 0 }}"
+
+            # ─────────────────────────────────────────────────────────
+            # FIX NOTE 12 -- removed the old "Collect per-package
+            # failure summaries" task that used to sit here. It built
+            # install_error via a non-existent Jinja filter
+            # (`extract_name_error`), threw an (ignored) error on every
+            # run with a failed package, and its output was immediately
+            # overwritten anyway by the two tasks below, which already
+            # build install_error correctly. Deleting it changes nothing
+            # about behavior; it only removes a permanently-broken,
+            # ignore_errors-masked task from every AWX job log.
+            # ─────────────────────────────────────────────────────────
+
+            - name: Initialize failed-package summary list
+              set_fact:
+                failed_package_summaries: []
+
+            - name: 'Build readable "name: error" summary for each failed package'
+              set_fact:
+                failed_package_summaries: "{{ failed_package_summaries + [item.name ~ ': ' ~ (item.error | default('unknown error'))] }}"
+              loop: "{{ package_install_results }}"
+              loop_control:
+                label: "{{ item.name }}"
+              when: item.status == 'failed'
+
+            - name: Set final consolidated install_error string
+              set_fact:
+                install_error: "{{ failed_package_summaries | join(' | ') }}"
+
+          rescue:
+            - name: Capture unexpected failure during the apply block (defense in depth)
+              set_fact:
+                install_error: >-
+                  {{ (install_error | default('')) }}{{ ' | ' if (install_error | default('')) else '' }}unexpected
+                  failure: {{ (ansible_failed_result.msg | default('see AWX job output for the failed task')) | truncate(400) }}
+
+            - name: Report unexpected failure and continue to reporting steps
+              debug:
+                msg: "Unexpected failure applying OS patches on {{ inventory_hostname }}: {{ install_error }}"
+
+      always:
+        - name: Remove patch scanner script and report file from target
+          file:
+            path: "{{ item }}"
+            state: absent
+          loop:
+            - "{{ remote_scanner }}"
+            - "{{ remote_scan_output }}"
+          ignore_errors: yes
+
+    - name: Note unsupported OS family
+      set_fact:
+        scan_error: "Unsupported ansible_os_family '{{ ansible_os_family }}' — no patch scan performed"
+      when:
+        - ansible_os_family not in ['Debian', 'RedHat']
+        - (scan_error | default('')) == ""
+
+    # ───────────────────────────────────────────────────────────────────
+    # Reboot detection — authoritative OS-native check, not a package-name
+    # guess. A kernel-name match alone would miss other reboot-triggering
+    # packages (glibc, systemd, etc.) and can't tell you the OS's own
+    # opinion.
+    # ───────────────────────────────────────────────────────────────────
+    - name: "[Debian] Check if the OS reports a reboot is required"
+      stat:
+        path: /var/run/reboot-required
+      register: deb_reboot_check
+      when: ansible_os_family == "Debian"
+
+    - name: "[RedHat] Check whether needs-restarting is already available"
+      command: command -v needs-restarting
+      register: needs_restarting_present
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: "[RedHat] Ensure needs-restarting helper is available (only hits the package manager if missing)"
+      package:
+        name: "{{ 'dnf-utils' if (ansible_pkg_mgr in ['dnf', 'dnf5']) else 'yum-utils' }}"
+        state: present
+      when:
+        - ansible_os_family == "RedHat"
+        - (needs_restarting_present.rc | default(1)) != 0
+      failed_when: false
+
+    - name: "[RedHat] Check if the OS reports a reboot is required"
+      command: needs-restarting -r
+      register: rh_reboot_check
+      changed_when: false
+      failed_when: false
+      when: ansible_os_family == "RedHat"
+
+    - name: "[RedHat] Warn if the reboot-required check itself could not run"
+      debug:
+        msg: >-
+          needs-restarting -r on {{ inventory_hostname }} returned unexpected rc={{ rh_reboot_check.rc | default('?') }}
+          (expected 0=no reboot needed, 1=reboot needed). reboot_required is being treated as false below, but that
+          may be wrong — verify manually, e.g. if dnf-utils/yum-utils failed to install on this host.
+      when:
+        - ansible_os_family == "RedHat"
+        - (rh_reboot_check.rc | default(0)) not in [0, 1]
+
+    - name: Determine whether a reboot is warranted (authoritative OS check)
+      set_fact:
+        reboot_required: >-
+          {{
+            (deb_reboot_check.stat.exists | default(false))
+            if ansible_os_family == "Debian"
+            else ((rh_reboot_check.rc | default(0)) == 1)
+            if ansible_os_family == "RedHat"
+            else false
+          }}
+
+    - name: Reboot host if the OS reports one is required
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Rebooting after OS patch via AWX apply_operating_system_patches_awx.yml"
+      when:
+        - effective_reboot_if_required
+        - reboot_required | bool
+        - not effective_dry_run
+        - any_changed | bool
+
+    # ───────────────────────────────────────────────────────────────────
+    # Report + publish to AWX job stats — both per-host (for the AWX UI)
+    # and a single aggregated artifact (per_host: false, reliable for any
+    # external caller polling the API).
+    #
+    # FIX NOTE 16 -- ansible_date_time was gathered once, at the start of
+    # this host's run (gather_facts: yes at the top of the play). On a
+    # host where the scan+apply took a while, reusing that stale
+    # timestamp here would misreport when patching actually finished.
+    # Fetch a fresh timestamp from the target right before building the
+    # report instead.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Get current timestamp on target (accurate completion time for the report)
+      command: date -u +%Y-%m-%dT%H:%M:%SZ
+      register: report_timestamp
+      changed_when: false
+      failed_when: false
+
+    - name: Get current timestamp on target in filename-safe form (for the persistent report snapshot)
+      command: date -u +%Y%m%dT%H%M%SZ
+      register: report_timestamp_filename
+      changed_when: false
+      failed_when: false
+
+    - name: Fall back to the play-start timestamp if the live date command failed for any reason
+      set_fact:
+        report_time_final: "{{ report_timestamp.stdout | default('') | trim | default(ansible_date_time.iso8601, true) }}"
+        report_time_filename_final: "{{ report_timestamp_filename.stdout | default('') | trim | default(ansible_date_time.iso8601_basic_short, true) }}"
+
+    - name: Build detailed applied-package log (old version, new version, classification, run time)
+      set_fact:
+        os_patch_details: >-
+          {{
+            all_patches
+            | selectattr('name', 'in', os_packages)
+            | map('combine', {'installed_at': report_time_final})
+            | list
+          }}
+
+    - name: Initialize enriched patch details list
+      set_fact:
+        os_patch_details_enriched: []
+
+    - name: Attach per-package install status (success/failed/preview) to each patched entry
+      set_fact:
+        os_patch_details_enriched: >-
+          {{
+            os_patch_details_enriched + [
+              item | combine(
+                (package_install_results | selectattr('name', 'equalto', item.name) | list | first)
+                | default({'status': 'not_attempted', 'changed': false, 'error': ''}, true)
+              )
+            ]
+          }}
+      loop: "{{ os_patch_details }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Replace os_patch_details with the enriched version
+      set_fact:
+        os_patch_details: "{{ os_patch_details_enriched }}"
+
+    # ───────────────────────────────────────────────────────────────────
+    # PATCH EXECUTION SUMMARY (per host). Numbered, human-readable, and
+    # dynamically labeled by mode.
+    # ───────────────────────────────────────────────────────────────────
+    - name: "Patch execution summary: {{ inventory_hostname }}"
+      debug:
+        msg:
+          - "============================================================"
+          - "                 PATCH EXECUTION SUMMARY"
+          - "============================================================"
+          - ""
+          - "Host                    : {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }})"
+          - "Execution Mode          : {{ 'SCAN ONLY' if effective_dry_run else 'APPLY PATCHES' }}"
+          - ""
+          - "1. OS Packages Found         : {{ os_patch_details | length }}"
+          - "2. OS Packages Installed     : {{ (os_patch_details | selectattr('status', 'equalto', 'success') | list | length) if not effective_dry_run else 0 }}"
+          - "3. Installation Status       : {{ 'NOT APPLIED (Scan Only)' if effective_dry_run else (('PATCHED' if any_changed else 'NO CHANGES NEEDED') if not install_error else 'PARTIAL / FAILED') }}"
+          - "4. Reboot Required           : {{ 'YES' if reboot_required else 'NO' }}"
+          - "5. Install Error             : {{ install_error if install_error else '(none)' }}"
+          - "6. Pending, Left Untouched   : {{ (all_patches | length) - (os_packages | length) }} (security/application packages)"
+          - "7. Low-Confidence Class.     : {{ low_confidence_os_packages | default([]) | length }} (fallback name-match, review recommended)"
+          - "============================================================"
+
+    - name: "{{ 'Available OS Patches' if effective_dry_run else 'Installed OS Patches' }} — {{ inventory_hostname }} ({{ os_patch_details | length }} total)"
+      debug:
+        msg:
+          - "name: {{ item.name }}"
+          - "current : {{ item.current_version }}"
+          - "new: {{ item.new_version }}{{ ' — ERROR: ' ~ item.error if (item.error | default('')) else '' }}"
+      loop: "{{ os_patch_details }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (os_patch_details | length) > 0
+
+    - name: Store operating system patch report as a plain host fact (for aggregation)
+      set_fact:
+        os_apply_report_fact:
+          hostname:           "{{ inventory_hostname }}"
+          dry_run:             "{{ effective_dry_run }}"
+          os_patched:          "{{ os_patch_details }}"
+          pending_left:        "{{ (all_patches | length) - (os_packages | length) }}"
+          changed:             "{{ any_changed | bool }}"
+          reboot_required:     "{{ reboot_required }}"
+          reboot_done:         "{{ effective_reboot_if_required and (reboot_required | bool) and not effective_dry_run }}"
+          install_error:       "{{ install_error }}"
+          scan_error:          "{{ scan_error }}"
+          low_confidence_packages: "{{ low_confidence_os_packages | default([]) }}"
+          report_time:         "{{ report_time_final }}"
+
+    - name: Publish per-host operating system patch report to AWX job stats
+      set_stats:
+        per_host: true
+        data:
+          os_apply_report: "{{ os_apply_report_fact }}"
+
+    # ───────────────────────────────────────────────────────────────────
+    # FIX NOTE 11 -- persistent, on-host audit trail that survives an AWX
+    # job log purge: one timestamped JSON snapshot per run, plus a
+    # rolling one-line history log for quick tailing/grepping.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Ensure persistent patch report directory exists on target
+      file:
+        path: "{{ persistent_report_dir }}"
+        state: directory
+        mode: "0750"
+        owner: root
+        group: root
+
+    - name: Write persistent JSON patch report snapshot for this run
+      copy:
+        dest: "{{ persistent_report_dir }}/os_patch_{{ inventory_hostname }}_{{ report_time_filename_final }}.json"
+        content: "{{ os_apply_report_fact | to_nice_json }}"
+        mode: "0640"
+        owner: root
+        group: root
+
+    - name: Append one-line summary to the rolling OS patch history log
+      lineinfile:
+        path: "{{ persistent_report_dir }}/os_patch_history.log"
+        create: yes
+        mode: "0640"
+        owner: root
+        group: root
+        insertafter: EOF
+        line: >-
+          {{ report_time_final }} host={{ inventory_hostname }}
+          mode={{ 'DRY_RUN' if effective_dry_run else 'APPLIED' }}
+          total_os_patches={{ os_patch_details | length }} changed={{ any_changed }}
+          reboot_required={{ reboot_required }}
+          install_errors={{ (package_install_results | selectattr('status', 'equalto', 'failed') | list | length) }}
+          scan_error={{ 'yes' if scan_error else 'no' }}
+
+- name: Aggregate operating system patch reports into one reliable job-level artifact
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: no
+  tasks:
+    - name: Build fleet-wide OS patch totals (across all hosts in this run)
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        fleet_os_totals:
+          # FIX NOTE 19 -- fleet_dry_run is read from the per-host fact
+          # (os_apply_report_fact.dry_run) that each host already
+          # computed from the Survey via effective_dry_run, NOT by
+          # re-reading the raw dry_run extra_var a second time here.
+          fleet_dry_run: "{{ (hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact.dry_run') | list | first) | default(true) | bool }}"
+          hosts_processed: "{{ ansible_play_hosts | length }}"
+          hosts_patched: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.changed', 'equalto', true) | list | length }}"
+          hosts_failed: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.install_error', 'ne', '') | list | length }}"
+          hosts_reboot_required: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | selectattr('value.os_apply_report_fact.reboot_required', 'equalto', true) | list | length }}"
+          total_os_packages: "{{ hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact.os_patched') | map('length') | sum }}"
+
+    # ───────────────────────────────────────────────────────────────────
+    # Flatten every host's os_patched list into a single
+    # "host | status  package: old -> new" line, fleet-wide. This list is
+    # only ever printed if show_fleet_package_list is explicitly enabled
+    # (FIX NOTE 20) so it costs nothing to build otherwise.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Build simple fleet-wide package display list (one line per package, per host)
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        fleet_display_lines: >-
+          {{
+            fleet_display_lines | default([]) +
+            [ item.0.hostname ~ ' | ' ~ (pkg.status | default('pending')) ~ '  ' ~ pkg.name ~ ': ' ~ pkg.current_version ~ ' -> ' ~ pkg.new_version ]
+          }}
+      vars:
+        pkg: "{{ item.1 }}"
+      # NOTE: the loop source itself resolves to an empty list when the
+      # feature flag is off, rather than gating a populated loop with a
+      # task-level `when`. Ansible evaluates `loop:` BEFORE `when` is
+      # checked per item, so a populated loop + a false `when` still
+      # prints one "skipping" line per item even though nothing ever
+      # runs. Emptying the loop source avoids that noise entirely --
+      # zero items means zero lines.
+      loop: >-
+        {{
+          query('subelements', hostvars | dict2items | selectattr('value.os_apply_report_fact', 'defined') | map(attribute='value.os_apply_report_fact') | list, 'os_patched', {'skip_missing': True})
+          if (show_fleet_package_list | default(false) | bool)
+          else []
+        }}
+      loop_control:
+        label: "{{ item.0.name | default('unknown') }}"
+
+    - name: Number the fleet-wide package display list
+      run_once: true
+      delegate_to: localhost
+      set_fact:
+        fleet_numbered_lines: >-
+          {{
+            range(1, (fleet_display_lines | default([]) | length) + 1) | list
+            | zip(fleet_display_lines | default([]))
+            | map('list') | list
+          }}
+      when: show_fleet_package_list | default(false) | bool
+
+    # ───────────────────────────────────────────────────────────────────
+    # FLEET SUMMARY. Numbered, human-readable, and dynamically labeled by
+    # mode. Overall Result distinguishes three apply-mode outcomes
+    # instead of one generic "SUCCESS" (FIX NOTE 21).
+    # ───────────────────────────────────────────────────────────────────
+    - name: "Fleet-wide patch execution summary"
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg:
+          - "============================================================"
+          - "                    FLEET SUMMARY"
+          - "============================================================"
+          - ""
+          - "Execution Mode          : {{ 'SCAN ONLY' if fleet_os_totals.fleet_dry_run else 'APPLY PATCHES' }}"
+          - ""
+          - "1. Hosts Processed           : {{ fleet_os_totals.hosts_processed }}"
+          - "2. Hosts Patched             : {{ fleet_os_totals.hosts_patched }}"
+          - "3. Hosts Failed              : {{ fleet_os_totals.hosts_failed }}"
+          - "4. Hosts Needing Reboot      : {{ fleet_os_totals.hosts_reboot_required }}"
+          - "5. {{ 'OS Packages Identified' if fleet_os_totals.fleet_dry_run else 'OS Packages Installed' }}   : {{ fleet_os_totals.total_os_packages }}"
+          - ""
+          - "Overall Result           : {{ 'SCAN COMPLETE' if fleet_os_totals.fleet_dry_run else (('PATCHED APPLIED' if fleet_os_totals.hosts_patched != '0' else 'NO CHANGES NEEDED') if fleet_os_totals.hosts_failed == '0' else 'COMPLETED WITH ERRORS') }}"
+          - "============================================================"
+
+    - name: "{{ 'Available OS Patches' if fleet_os_totals.fleet_dry_run else 'Installed OS Patches' }} (fleet-wide, numbered)"
+      run_once: true
+      delegate_to: localhost
+      debug:
+        msg: "{{ '%3d' | format(item.0) }}. {{ item.1 }}"
+      loop: "{{ fleet_numbered_lines | default([]) }}"
+      loop_control:
+        label: "package {{ item.0 }}"
+      when:
+        - (fleet_display_lines | default([]) | length) > 0
+        - show_fleet_package_list | default(false) | bool
+
+    - name: Publish aggregated report (single job-level artifact)
+      run_once: true
+      delegate_to: localhost
+      set_stats:
+        per_host: false
+        data:
+          os_apply_report_all: >-
+            {{
+              dict(ansible_play_hosts
+                   | zip(ansible_play_hosts | map('extract', hostvars, 'os_apply_report_fact')))
+            }}
+          os_apply_totals: "{{ fleet_os_totals }}"
+
+# ─────────────────────────────────────────────────────────────────────────
+# AWX SURVEY (Job Template -> Survey tab) — suggested definition. Import
+# via "Create survey" screen or by pasting into the survey spec editor.
+# The Survey is the single source of truth for dry_run / reboot_if_required
+# (see FIX NOTE 1 at the top of this file) — no other default competes
+# with it.
+#
+# {
+#   "name": "",
+#   "description": "",
+#   "spec": [
+#     {
+#       "question_name": "Target hosts",
+#       "question_description": "Inventory group or host pattern to run against",
+#       "variable": "target_hosts",
+#       "type": "text",
+#       "required": true,
+#       "default": "all"
+#     },
+#     {
+#       "question_name": "Dry run (preview only)?",
+#       "question_description": "true = list pending OS patches only, nothing is installed. false = install them.",
+#       "variable": "dry_run",
+#       "type": "multiplechoice",
+#       "choices": "true\nfalse",
+#       "required": true,
+#       "default": "true"
+#     },
+#     {
+#       "question_name": "Reboot automatically if required?",
+#       "question_description": "true = reboot the host if the OS reports a reboot is needed after patching. false = report only.",
+#       "variable": "reboot_if_required",
+#       "type": "multiplechoice",
+#       "choices": "true\nfalse",
+#       "required": true,
+#       "default": "false"
+#     },
+#     {
+#       "question_name": "Scanner timeout (seconds)",
+#       "question_description": "Increase on hosts with slow or heavily-mirrored repos. Default 1800 (30 min).",
+#       "variable": "patch_scan_timeout",
+#       "type": "integer",
+#       "required": false,
+#       "default": 1800
+#     },
+#     {
+#       "question_name": "Show fleet-wide package list?",
+#       "question_description": "true = also print the full fleet-wide package-by-package listing (verbose). false = short summary only.",
+#       "variable": "show_fleet_package_list",
+#       "type": "multiplechoice",
+#       "choices": "true\nfalse",
+#       "required": false,
+#       "default": "false"
+#     },
+#     {
+#       "question_name": "Manual OS-classification force-include (comma or newline separated package names)",
+#       "question_description": "Packages the scanner missed that should always be treated as OS regardless of metadata (e.g. python3-attr, python3-tz, python3-packaging, tcpdump if your fleet wants them treated as OS).",
+#       "variable": "os_classification_force_include",
+#       "type": "textarea",
+#       "required": false,
+#       "default": ""
+#     },
+#     {
+#       "question_name": "Manual OS-classification force-exclude (comma or newline separated package names)",
+#       "question_description": "Packages the scanner over-selects that should never be treated as OS regardless of metadata.",
+#       "variable": "os_classification_force_exclude",
+#       "type": "textarea",
+#       "required": false,
+#       "default": ""
+#     }
+#   ]
+# }
