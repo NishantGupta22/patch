@@ -1,221 +1,993 @@
 ---
-# =============================================================================
-# Application Patching Playbook
+# apply_application_patches_awx.yml
 #
-# Upgrades ONLY installed application packages. Never upgrades the OS,
-# kernel, GRUB, or firmware, and never runs dist-upgrade/full-upgrade.
+# Self-contained AWX job: scans a host, identifies which pending updates
+# are APPLICATION packages (per an approved catalog, or via
+# auto-discovery with a protected-package exclusion list), and installs
+# ONLY those. The kernel, systemd, glibc/libc, openssl, bash, sudo,
+# firmware, bootloader, and every other base-OS package are NEVER
+# touched, regardless of discovery_mode or selective application_list —
+# see PROTECTED PACKAGES below.
 #
-# Usage:
-#   Dry run (no changes):
-#     ansible-playbook app_patch.yml --check
+# No survey fields required beyond the ones below — this is meant to be
+# schedulable as-is (e.g. "run weekly, patch approved apps only").
 #
-#   Patch everything in the catalog that's installed:
-#     ansible-playbook app_patch.yml
+#   target_hosts        which inventory group/host to run against
+#   dry_run              true (default) = preview only, check mode
+#   discovery_mode        "catalog" (default) = only patch apps in the
+#                         built-in catalog below. "auto" = patch any
+#                         pending update that isn't a protected OS
+#                         package, whether or not it's in the catalog.
+#   application_list       optional list (or comma-separated string, so
+#                         AWX text-survey fields work too) of catalog
+#                         keys and/or exact package names to restrict
+#                         this run to (selective patching). Empty = all
+#                         eligible application packages.
+#   auto_reboot           false (default) — this role NEVER infers a
+#                         reboot need from what was patched; it reboots
+#                         only when this is explicitly set true, the
+#                         run wasn't a dry run, and something changed.
+#   verify_services       true (default) = post-patch systemd health
+#                         check (restart-with-retry) for each patched
+#                         catalog application's known service unit(s).
 #
-#   Patch only specific applications:
-#     ansible-playbook app_patch.yml -e '{"application_list": ["nginx","docker"]}'
-# =============================================================================
+# PROTECTED PACKAGES: application_patch_protected_exclusions below is a
+# fixed regex list covering kernel, systemd, glibc/libc, openssl, bash,
+# sudo, firmware/microcode, bootloader (grub/shim), and base-OS/package
+# -manager plumbing (dpkg/apt/rpm/dnf/yum, *-release, coreutils,
+# util-linux, pam, shadow, filesystem, ...) for both Debian/Ubuntu/Kali
+# and RHEL-family naming. It's combined into
+# application_patch_final_exclusions with any site additions from
+# application_patch_extra_exclusions (survey/extra_vars can only ADD to
+# this list, never remove a built-in entry).
+#
+# APPLICATION CATALOG: application_patch_catalog maps ~29 common
+# enterprise apps (nginx, apache/httpd, docker/containerd/podman,
+# mysql/mariadb/postgresql/mongodb/redis/rabbitmq, tomcat, jenkins,
+# grafana/prometheus/node_exporter, bacula, zabbix-agent,
+# elasticsearch/kibana/logstash, php, python, nodejs, java, git,
+# ansible, keepalived, haproxy, squid) to glob-style package-name
+# patterns per distro family and a systemd service-unit pattern used by
+# the post-patch verification step. Extend it per-site with
+# application_patch_extra_catalog (merged in, never replaces).
+#
+# CLASSIFICATION LOGIC (identical on every host, run by the embedded
+# scanner script below):
+#   1. Package matches a protected-exclusion pattern -> NEVER eligible.
+#   2. discovery_mode=="catalog": eligible only if it also matches a
+#      catalog pattern for the host's distro family.
+#      discovery_mode=="auto": eligible if step 1 didn't exclude it.
+#   3. If application_list is non-empty, further restrict to packages
+#      whose catalog app key OR exact package name is in that list.
+#
+# INSTALL ENFORCEMENT: the scanner's classification produces an
+# explicit package NAME LIST per host; the install task then targets
+# only that exact list (apt/package state=latest) — never a wildcard —
+# so packages outside the classified set are structurally untouched,
+# not just untouched by convention. This also makes the run idempotent:
+# re-applying against an already-patched host is a no-op.
+#
+# SERVICE VERIFICATION: after a non-dry-run apply, every catalog
+# application actually patched has its known systemd unit(s) checked
+# via `systemctl`, with a retry/restart attempt if not active. Apps
+# patched only via auto-discovery (no catalog entry) have nothing to
+# verify — they still appear in the report as patched.
+#
+# REBOOT: never inferred from what was patched (unlike a kernel/security
+# patch job) — only happens when auto_reboot is explicitly set true.
+#
+# FAILURE HANDLING: the install step is wrapped in block/rescue so a
+# single package's dependency conflict or install failure is captured
+# and reported cleanly instead of aborting the whole host's run mid-way
+# and silently skipping verification/reporting for it.
+#
+# MAINTENANCE WINDOWS: `patch_serial` controls how many hosts are
+# patched concurrently (Ansible's `serial`). Defaults to '100%' (no
+# batching) — override via survey/extra_vars (e.g. 10, or '20%') to
+# limit blast radius across a large fleet.
+#
+# Compatibility: Ubuntu/Debian/Kali (apt) and RHEL family
+# (dnf5/dnf/yum, including AlmaLinux/Rocky/CentOS/RHEL/Amazon
+# Linux/Oracle Linux).
 
-- name: Application Patching
-  hosts: all
-  become: true
-  gather_facts: true
-
+- name: Apply Application-Only Patches (AWX)
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: yes
+  become: yes
+  serial: "{{ patch_serial | default('100%') }}"
   vars:
-    # Leave empty to patch every installed package from known_applications.
-    # Set to specific package names to patch only those.
+    remote_scanner: "/tmp/.app_patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
+    dry_run: true
+    discovery_mode: "catalog"
     application_list: []
+    auto_reboot: false
+    verify_services: true
+    service_verify_retries: 5
+    service_verify_delay: 3
+    reboot_timeout: 600
+    patch_scan_timeout: 900
+    patch_scanner_python: "/usr/bin/python3"
+    generate_report: true
+    report_remote_dir: "/var/log/application_patch_reports"
+    report_fetch_to_controller: true
+    report_local_dir: "{{ playbook_dir }}/reports"
 
-    restart_services: true
-    refresh_cache: true
+    # Extend-only hooks (add to, never replaces, the built-ins below)
+    application_patch_extra_exclusions: []
+    application_patch_extra_catalog: {}
 
-    # Catalog of application packages this playbook is allowed to touch.
-    known_applications:
-      - nginx
-      - apache2
-      - httpd
-      - mysql
-      - mysql-server
-      - mariadb
-      - mariadb-server
-      - postgresql
-      - redis
-      - redis-server
-      - docker
-      - docker-ce
-      - podman
-      - nodejs
-      - php
-      - php-fpm
-      - java
-      - git
-      - openssl
-      - curl
-      - vim
-      - tmux
-      - chrony
-      - rsyslog
-      - logrotate
-      - ansible
-      - filebeat
-      - metricbeat
-      - auditd
-      - fail2ban
-      - samba
-      - nfs-utils
-      - bind9
-      - postfix
-      - dovecot
-      - squid
-      - haproxy
-      - keepalived
-      - openvpn
-      - wireguard
+    # ── PROTECTED PACKAGES (fixed; only ever added to, never weakened) ──
+    application_patch_protected_exclusions:
+      # kernel
+      - '^linux-image(-.*)?$'
+      - '^linux-headers(-.*)?$'
+      - '^linux-modules(-.*)?$'
+      - '^linux-modules-extra(-.*)?$'
+      - '^kernel(-core|-modules(-extra)?|-devel|-headers|-tools(-libs)?)?$'
+      - '^kernel-uek(-.*)?$'
+      - '^kernel-lt(-.*)?$'
+      - '^kernel-rt(-.*)?$'
+      # init system
+      - '^systemd(-.*)?$'
+      - '^udev$'
+      - '^dbus(-.*)?$'
+      - '^dbus-broker$'
+      # core C library / toolchain
+      - '^glibc(-.*)?$'
+      - '^libc6(-.*)?$'
+      - '^libc-bin$'
+      - '^libc-dev-bin$'
+      - '^libc6-dev$'
+      # TLS / crypto
+      - '^openssl$'
+      - '^openssl-libs$'
+      - '^libssl\d*(-.*)?$'
+      - '^libcrypto\d*(-.*)?$'
+      # shell / privilege escalation
+      - '^bash$'
+      - '^dash$'
+      - '^sudo$'
+      - '^sudo-.*$'
+      # firmware / microcode
+      - '^.*-firmware$'
+      - '^linux-firmware$'
+      - '^amd64-microcode$'
+      - '^intel-microcode$'
+      - '^microcode_ctl$'
+      # bootloader
+      - '^grub2?(-.*)?$'
+      - '^grub-efi(-.*)?$'
+      - '^grub-pc(-.*)?$'
+      - '^grub-common$'
+      - '^shim(-.*)?$'
+      - '^shim-signed$'
+      - '^efibootmgr$'
+      # base OS / package-manager plumbing
+      - '^base-files$'
+      - '^base-passwd$'
+      - '^coreutils$'
+      - '^util-linux(-.*)?$'
+      - '^dpkg(-.*)?$'
+      - '^apt$'
+      - '^apt-.*$'
+      - '^rpm(-.*)?$'
+      - '^yum(-.*)?$'
+      - '^dnf(-.*)?$'
+      - '^dnf5(-.*)?$'
+      - '^libdnf5?(-.*)?$'
+      - '^.*-release$'
+      - '^filesystem$'
+      - '^ncurses(-.*)?$'
+      - '^zlib(-.*)?$'
+      - '^pam(-.*)?$'
+      - '^login$'
+      - '^shadow-utils$'
+      - '^passwd$'
+      - '^initramfs-tools(-.*)?$'
+      - '^dracut(-.*)?$'
 
-    # Never touch these, even if accidentally listed above.
-    hard_excluded_packages:
-      - kernel
-      - kernel-core
-      - grub2
-      - systemd
-      - glibc
-      - libc6
+    application_patch_final_exclusions: "{{ application_patch_protected_exclusions + (application_patch_extra_exclusions | default([])) }}"
 
-    # package -> service name, for restarting only what actually changed.
-    app_service_map:
-      nginx: nginx
-      apache2: apache2
-      httpd: httpd
-      mysql: mysql
-      mysql-server: mysql
-      mariadb: mariadb
-      mariadb-server: mariadb
-      postgresql: postgresql
-      redis: redis
-      redis-server: redis-server
-      docker: docker
-      docker-ce: docker
-      podman: podman
-      php-fpm: php-fpm
-      chrony: chronyd
-      rsyslog: rsyslog
-      fail2ban: fail2ban
-      samba: smb
-      bind9: named
-      postfix: postfix
-      dovecot: dovecot
-      squid: squid
-      haproxy: haproxy
-      keepalived: keepalived
-      openvpn: openvpn@server
-      wireguard: wg-quick@wg0
+    # ── APPLICATION CATALOG (used when discovery_mode == "catalog") ──
+    application_patch_builtin_catalog:
+      nginx:
+        debian_packages: ["nginx", "nginx-common", "nginx-core", "nginx-full", "nginx-light", "nginx-extras"]
+        redhat_packages: ["nginx", "nginx-*"]
+        services: ["nginx"]
+      apache:
+        debian_packages: ["apache2", "apache2-*", "libapache2-*"]
+        redhat_packages: ["httpd", "httpd-*", "mod_*"]
+        services: ["apache2", "httpd"]
+      docker:
+        debian_packages: ["docker-ce", "docker-ce-cli", "docker-ce-rootless-extras", "docker.io", "docker-buildx-plugin", "docker-compose-plugin"]
+        redhat_packages: ["docker-ce", "docker-ce-cli", "docker-ce-rootless-extras", "docker-buildx-plugin", "docker-compose-plugin"]
+        services: ["docker"]
+      containerd:
+        debian_packages: ["containerd", "containerd.io"]
+        redhat_packages: ["containerd.io", "containerd"]
+        services: ["containerd"]
+      podman:
+        debian_packages: ["podman", "podman-*"]
+        redhat_packages: ["podman", "podman-*"]
+        services: ["podman"]
+      mysql:
+        debian_packages: ["mysql-server", "mysql-server-*", "mysql-client", "mysql-client-*", "mysql-common"]
+        redhat_packages: ["mysql-server", "mysql", "mysql-community-server", "mysql-community-client"]
+        services: ["mysql", "mysqld"]
+      mariadb:
+        debian_packages: ["mariadb-server", "mariadb-server-*", "mariadb-client", "mariadb-client-*", "mariadb-common"]
+        redhat_packages: ["mariadb-server", "mariadb", "MariaDB-server", "MariaDB-client"]
+        services: ["mariadb", "mysql"]
+      postgresql:
+        debian_packages: ["postgresql", "postgresql-*"]
+        redhat_packages: ["postgresql*-server", "postgresql*"]
+        services: ["postgresql"]
+      mongodb:
+        debian_packages: ["mongodb-org", "mongodb-org-*"]
+        redhat_packages: ["mongodb-org", "mongodb-org-*"]
+        services: ["mongod"]
+      redis:
+        debian_packages: ["redis-server", "redis-tools", "redis"]
+        redhat_packages: ["redis", "redis-*"]
+        services: ["redis", "redis-server"]
+      rabbitmq:
+        debian_packages: ["rabbitmq-server"]
+        redhat_packages: ["rabbitmq-server"]
+        services: ["rabbitmq-server"]
+      tomcat:
+        debian_packages: ["tomcat9", "tomcat9-*", "tomcat10", "tomcat10-*"]
+        redhat_packages: ["tomcat", "tomcat-*"]
+        services: ["tomcat9", "tomcat10", "tomcat"]
+      jenkins:
+        debian_packages: ["jenkins"]
+        redhat_packages: ["jenkins"]
+        services: ["jenkins"]
+      grafana:
+        debian_packages: ["grafana", "grafana-*"]
+        redhat_packages: ["grafana", "grafana-*"]
+        services: ["grafana-server"]
+      prometheus:
+        debian_packages: ["prometheus", "prometheus-*"]
+        redhat_packages: ["prometheus2", "prometheus"]
+        services: ["prometheus"]
+      node_exporter:
+        debian_packages: ["prometheus-node-exporter"]
+        redhat_packages: ["node_exporter"]
+        services: ["prometheus-node-exporter", "node_exporter"]
+      bacula:
+        debian_packages: ["bacula-*"]
+        redhat_packages: ["bacula-*"]
+        services: ["bacula-fd", "bacula-sd", "bacula-dir"]
+      zabbix_agent:
+        debian_packages: ["zabbix-agent", "zabbix-agent2"]
+        redhat_packages: ["zabbix-agent", "zabbix-agent2"]
+        services: ["zabbix-agent", "zabbix-agent2"]
+      elasticsearch:
+        debian_packages: ["elasticsearch"]
+        redhat_packages: ["elasticsearch"]
+        services: ["elasticsearch"]
+      kibana:
+        debian_packages: ["kibana"]
+        redhat_packages: ["kibana"]
+        services: ["kibana"]
+      logstash:
+        debian_packages: ["logstash"]
+        redhat_packages: ["logstash"]
+        services: ["logstash"]
+      php:
+        debian_packages: ["php*"]
+        redhat_packages: ["php*"]
+        services: ["php*-fpm"]
+      python:
+        debian_packages: ["python3*", "python2*"]
+        redhat_packages: ["python3*", "python2*"]
+        services: []
+      nodejs:
+        debian_packages: ["nodejs"]
+        redhat_packages: ["nodejs"]
+        services: []
+      java:
+        debian_packages: ["openjdk-*-jdk", "openjdk-*-jre*", "default-jdk", "default-jre"]
+        redhat_packages: ["java-*-openjdk*"]
+        services: []
+      git:
+        debian_packages: ["git", "git-*"]
+        redhat_packages: ["git", "git-*"]
+        services: []
+      ansible:
+        debian_packages: ["ansible", "ansible-core"]
+        redhat_packages: ["ansible", "ansible-core"]
+        services: []
+      keepalived:
+        debian_packages: ["keepalived"]
+        redhat_packages: ["keepalived"]
+        services: ["keepalived"]
+      haproxy:
+        debian_packages: ["haproxy"]
+        redhat_packages: ["haproxy"]
+        services: ["haproxy"]
+      squid:
+        debian_packages: ["squid", "squid-*"]
+        redhat_packages: ["squid"]
+        services: ["squid"]
+
+    application_patch_catalog: "{{ application_patch_builtin_catalog | combine(application_patch_extra_catalog | default({}), recursive=True) }}"
 
   tasks:
-    - name: Gather installed package facts
-      ansible.builtin.package_facts:
-        manager: auto
 
-    - name: Refresh package cache (Debian family)
-      ansible.builtin.apt:
-        update_cache: true
+    # ───────────────────────────────────────────────────────────────────
+    # Validate + normalize input
+    # ───────────────────────────────────────────────────────────────────
+    - name: Validate discovery_mode
+      assert:
+        that:
+          - discovery_mode in ['catalog', 'auto']
+        fail_msg: "discovery_mode must be 'catalog' or 'auto', got '{{ discovery_mode }}'"
+        quiet: true
+
+    # AWX text-survey fields arrive as one comma-separated string
+    # (e.g. "nginx, docker"), not a YAML list — normalize either shape.
+    - name: Normalize application_list (supports AWX text-survey comma-separated input)
+      set_fact:
+        application_list: >-
+          {{
+            (application_list.split(',') | map('trim') | reject('equalto', '') | list)
+            if (application_list is string) else (application_list | default([]))
+          }}
+
+    - name: Warn if a selective application_list entry is actually a protected OS package
+      debug:
+        msg: >-
+          WARNING: application_list entry '{{ item }}' matches a protected
+          OS package pattern and will NEVER be patched, regardless of
+          selection — see application_patch_protected_exclusions above.
+      loop: "{{ application_list }}"
+      when: application_patch_final_exclusions | select('search', item) | list | length > 0
+
+    - name: Initialize run facts
+      set_fact:
+        application_all_candidates: []
+        application_eligible: []
+        application_scan_error: ""
+        application_install_error: ""
+        application_patched_changed: false
+        application_service_report: []
+
+    # ───────────────────────────────────────────────────────────────────
+    # Refresh package metadata so classification is accurate
+    # (metadata sync only — never installs/upgrades anything)
+    # ───────────────────────────────────────────────────────────────────
+    - name: "[Debian] Refresh apt cache"
+      shell: |
+        set -o pipefail
+        apt-get update -o Acquire::Retries=3
+      args:
+        executable: /bin/bash
+      environment: { LC_ALL: C, LANG: C }
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: apt_update_result
+      when: ansible_os_family == "Debian"
+
+    - name: "[Debian] Warn (non-fatal) if any repo failed to refresh"
+      debug:
+        msg: >-
+          apt-get update reported errors on {{ inventory_hostname }} — scan
+          will continue using whatever repos did refresh.
+          {{ (apt_update_result.stderr | default('') + ' ' + apt_update_result.stdout | default(''))
+             | trim | truncate(400) }}
       when:
-        - ansible_os_family in ['Debian', 'Kali']
-        - refresh_cache | bool
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined
+        - apt_update_result.rc != 0
 
-    - name: Refresh package cache (RedHat family)
-      ansible.builtin.dnf:
-        update_cache: true
+    - name: "[RedHat] Refresh package metadata"
+      shell: |
+        set -e
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q makecache
+      args:
+        executable: /bin/bash
+      environment: { LC_ALL: C, LANG: C }
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: rh_makecache
+      when: ansible_os_family == "RedHat"
+
+    - name: "[RedHat] Warn (non-fatal) if metadata refresh failed"
+      debug:
+        msg: >-
+          makecache reported errors on {{ inventory_hostname }} — scan will
+          continue using whatever repos did refresh.
+          {{ (rh_makecache.stderr | default('') + ' ' + rh_makecache.stdout | default(''))
+             | trim | truncate(400) }}
       when:
-        - ansible_os_family == 'RedHat'
-        - refresh_cache | bool
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined
+        - rh_makecache.rc != 0
 
-    - name: Build candidate package list (all cataloged apps that are installed)
-      ansible.builtin.set_fact:
-        candidate_packages: "{{ known_applications | select('in', ansible_facts.packages.keys()) | list }}"
-      when: application_list | length == 0
+    - name: Note unsupported OS family
+      set_fact:
+        application_scan_error: "Unsupported ansible_os_family '{{ ansible_os_family }}' — no scan performed"
+      when: ansible_os_family not in ['Debian', 'RedHat']
 
-    - name: Build candidate package list (only requested apps that are installed)
-      ansible.builtin.set_fact:
-        candidate_packages: "{{ application_list | select('in', ansible_facts.packages.keys()) | list }}"
-      when: application_list | length > 0
+    # ───────────────────────────────────────────────────────────────────
+    # Scan, classify, and apply — contained so a scan/apply failure on
+    # one host never prevents verification/reporting from still running.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Scan, classify and apply application-only patches
+      when: ansible_os_family in ['Debian', 'RedHat']
+      block:
 
-    - name: Remove hard-excluded packages from the candidate list
-      ansible.builtin.set_fact:
-        candidate_packages: "{{ candidate_packages | difference(hard_excluded_packages) }}"
+        - name: Copy application patch scanner script to remote host
+          copy:
+            dest: "{{ remote_scanner }}"
+            mode: "0700"
+            content: |
+              {% raw %}
+              #!/usr/bin/env python3
+              """
+              app_patch_scanner.py — used by apply_application_patches_awx.yml.
+              Classifies pending package updates as an approved "application"
+              package or a protected OS package, per rules passed in via
+              environment variables (exclusion regexes, catalog, discovery
+              mode, selective application list). Never installs or modifies
+              packages; always exits 0 and prints valid JSON.
+              """
 
-    - name: Show packages that will be patched
-      ansible.builtin.debug:
-        msg: "{{ candidate_packages }}"
+              import fnmatch
+              import json
+              import os
+              import re
+              import shutil
+              import subprocess
+              import sys
 
-    - name: Record installed versions before patching
-      ansible.builtin.set_fact:
-        pre_patch_versions: "{{ pre_patch_versions | default({}) | combine({item: ansible_facts.packages[item][0].version}) }}"
-      loop: "{{ candidate_packages }}"
-      loop_control:
-        label: "{{ item }}"
+              def run(cmd, timeout=180):
+                  try:
+                      proc = subprocess.run(cmd, capture_output=True, text=True,
+                                             timeout=timeout, errors="replace")
+                      return proc.returncode, proc.stdout, proc.stderr
+                  except FileNotFoundError:
+                      return 127, "", "command not found"
+                  except subprocess.TimeoutExpired:
+                      return 124, "", "timed out"
+                  except Exception as exc:
+                      return 1, "", str(exc)
 
-    - name: Upgrade candidate packages (Debian family)
-      ansible.builtin.apt:
-        name: "{{ item }}"
-        state: latest
-        only_upgrade: true
-      loop: "{{ candidate_packages }}"
-      loop_control:
-        label: "{{ item }}"
+              ARCH_SUFFIX_RE = re.compile(
+                  r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
+              )
+
+              def strip_arch(name):
+                  return ARCH_SUFFIX_RE.sub("", name)
+
+              def strip_nevra(nevra):
+                  """'coreutils-8.32-41.el9_8.x86_64' -> 'coreutils'."""
+                  name = ARCH_SUFFIX_RE.sub("", nevra)
+                  parts = name.rsplit("-", 2)
+                  return parts[0] if len(parts) == 3 else name
+
+              EXCLUSIONS = json.loads(os.environ.get("APP_PATCH_EXCLUSIONS", "[]"))
+              CATALOG    = json.loads(os.environ.get("APP_PATCH_CATALOG", "{}"))
+              MODE       = os.environ.get("APP_PATCH_DISCOVERY_MODE", "catalog")
+              APP_LIST   = json.loads(os.environ.get("APP_PATCH_APPLICATION_LIST", "[]"))
+              APP_LIST_LOWER = {a.lower() for a in APP_LIST}
+
+              _EXCLUSION_RE = []
+              for _pat in EXCLUSIONS:
+                  try:
+                      _EXCLUSION_RE.append(re.compile(_pat, re.I))
+                  except re.error:
+                      continue
+
+              def is_excluded(pkg_name):
+                  return any(r.search(pkg_name) for r in _EXCLUSION_RE)
+
+              def build_catalog_index(pkg_key):
+                  idx = []
+                  for app, spec in CATALOG.items():
+                      for pat in (spec.get(pkg_key) or []):
+                          idx.append((pat, app))
+                  return idx
+
+              def match_catalog(pkg_name, idx):
+                  low = pkg_name.lower()
+                  for pat, app in idx:
+                      if fnmatch.fnmatchcase(low, pat.lower()):
+                          return app
+                  return None
+
+              def selective_allowed(pkg_name, catalog_app):
+                  if not APP_LIST_LOWER:
+                      return True
+                  if catalog_app and catalog_app.lower() in APP_LIST_LOWER:
+                      return True
+                  return pkg_name.lower() in APP_LIST_LOWER
+
+              def classify(pkg_name, idx):
+                  if is_excluded(pkg_name):
+                      return False, None, "excluded_protected_os_package"
+                  catalog_app = match_catalog(pkg_name, idx)
+                  if MODE == "catalog" and catalog_app is None:
+                      return False, None, "not_in_approved_application_catalog"
+                  if not selective_allowed(pkg_name, catalog_app):
+                      return False, catalog_app, "not_in_selective_application_list"
+                  return True, catalog_app, ""
+
+              # ── Debian / Ubuntu / Kali ──────────────────────────────
+              def get_apt_policy(pkgs):
+                  rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
+                  result, cur_pkg = {}, None
+                  for line in out.splitlines():
+                      m = re.match(r"^(\S+):$", line)
+                      if m:
+                          cur_pkg = m.group(1)
+                          result[cur_pkg] = {"installed": "unknown", "candidate": "unknown"}
+                          continue
+                      if cur_pkg:
+                          mi = re.match(r"\s+Installed:\s+(\S+)", line)
+                          mc = re.match(r"\s+Candidate:\s+(\S+)", line)
+                          if mi:
+                              v = mi.group(1)
+                              result[cur_pkg]["installed"] = "" if v == "(none)" else v
+                          if mc:
+                              v = mc.group(1)
+                              result[cur_pkg]["candidate"] = "" if v == "(none)" else v
+                  return result
+
+              def scan_debian():
+                  rc, out, _ = run(
+                      ["apt-get", "-s", "dist-upgrade", "-o", "Debug::NoLocking=true"],
+                      timeout=300,
+                  )
+                  pkgs = sorted({l.split()[1] for l in out.splitlines()
+                                 if l.startswith("Inst ") and len(l.split()) > 1})
+                  if not pkgs:
+                      return []
+                  policy = get_apt_policy(pkgs)
+                  idx = build_catalog_index("debian_packages")
+                  results = []
+                  for pkg in pkgs:
+                      pol = policy.get(pkg, {})
+                      cur_ver = pol.get("installed", "unknown") or "unknown"
+                      new_ver = pol.get("candidate", "unknown") or "unknown"
+                      is_app, catalog_app, reason = classify(pkg, idx)
+                      results.append({
+                          "name": pkg, "current_version": cur_ver, "new_version": new_ver,
+                          "is_application": is_app, "catalog_app": catalog_app or "",
+                          "skip_reason": reason,
+                      })
+                  return results
+
+              # ── RHEL / AlmaLinux / Rocky / CentOS / Amazon / Oracle ─
+              def parse_check_update(text):
+                  SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Loading mirror",
+                                    "Security:", "Added Packages")
+                  SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Za-z ]+Packages\s*:?$")
+                  in_obsoleting, pkgs = False, []
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+                      if re.match(r"^Obsoleting", line, re.I):
+                          in_obsoleting = True
+                          continue
+                      if SECTION_HEADER_RE.match(line):
+                          in_obsoleting = False
+                          continue
+                      if in_obsoleting or any(line.startswith(p) for p in SKIP_PREFIXES):
+                          continue
+                      if re.match(r"^[=\-\*]+$", line):
+                          continue
+                      parts = line.split()
+                      if len(parts) < 2:
+                          continue
+                      name = strip_arch(parts[0])
+                      if not name or re.match(r"^\d", name):
+                          continue
+                      pkgs.append(name)
+                  return sorted(set(pkgs))
+
+              def parse_pkg_info(text, only_section=None):
+                  result, block, cur_key, cur_section = {}, {}, None, None
+                  def header_kind(line):
+                      h = line.strip().lower().rstrip(":").strip()
+                      if h == "installed packages": return "installed"
+                      if h == "available packages": return "available"
+                      return None
+                  for line in text.splitlines():
+                      kind = header_kind(line)
+                      if kind:
+                          cur_section = kind
+                          continue
+                      if not line.strip():
+                          if "Name" in block and (only_section is None or cur_section == only_section):
+                              result.setdefault(block["Name"], block)
+                          block, cur_key = {}, None
+                          continue
+                      if line[:1] in (" ", "\t") and cur_key:
+                          block[cur_key] = (block.get(cur_key, "") + " " + line.strip()).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          block[key] = val
+                          cur_key = key
+                  if "Name" in block and (only_section is None or cur_section == only_section):
+                      result.setdefault(block["Name"], block)
+                  return result
+
+              def scan_redhat():
+                  mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
+                  if not mgr:
+                      return []
+                  rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
+                  if rc not in (0, 100):
+                      return []
+                  pkgs = parse_check_update(out)
+                  if not pkgs:
+                      return []
+                  _, avail_out, _ = run([mgr, "-q", "info", *pkgs], timeout=180)
+                  avail = parse_pkg_info(avail_out, only_section="available")
+                  _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
+                  installed = parse_pkg_info(inst_out, only_section="installed")
+                  idx = build_catalog_index("redhat_packages")
+
+                  def _fmt_version(info):
+                      ver, rel = info.get("Version", ""), info.get("Release", "")
+                      epoch = info.get("Epoch", "0")
+                      base = f"{ver}-{rel}" if rel else (ver or "unknown")
+                      if base == "unknown":
+                          return base
+                      return f"{epoch}:{base}" if epoch not in ("", "0") else base
+
+                  results = []
+                  for pkg in pkgs:
+                      a, i = avail.get(pkg, {}), installed.get(pkg, {})
+                      is_app, catalog_app, reason = classify(pkg, idx)
+                      results.append({
+                          "name": pkg,
+                          "current_version": _fmt_version(i),
+                          "new_version": _fmt_version(a),
+                          "is_application": is_app, "catalog_app": catalog_app or "",
+                          "skip_reason": reason,
+                      })
+                  return results
+
+              def main():
+                  os_family = sys.argv[1] if len(sys.argv) > 1 else ""
+                  try:
+                      if os_family == "Debian":
+                          patches = scan_debian()
+                      elif os_family == "RedHat":
+                          patches = scan_redhat()
+                      else:
+                          patches = []
+                  except Exception:
+                      patches = []
+                  print(json.dumps(patches))
+
+              if __name__ == "__main__":
+                  main()
+              {% endraw %}
+
+        - name: Run application patch scanner
+          command: >
+            {{ patch_scanner_python }}
+            {{ remote_scanner }}
+            {{ ansible_os_family }}
+          register: scan_result
+          changed_when: false
+          failed_when: false
+          timeout: "{{ patch_scan_timeout }}"
+          environment:
+            LC_ALL: C
+            LANG: C
+            APP_PATCH_EXCLUSIONS: "{{ application_patch_final_exclusions | to_json }}"
+            APP_PATCH_CATALOG: "{{ application_patch_catalog | to_json }}"
+            APP_PATCH_DISCOVERY_MODE: "{{ discovery_mode }}"
+            APP_PATCH_APPLICATION_LIST: "{{ application_list | to_json }}"
+
+        - name: Parse application patch scanner output
+          block:
+            - set_fact:
+                application_all_candidates: "{{ scan_result.stdout | from_json }}"
+          rescue:
+            - set_fact:
+                application_all_candidates: []
+                application_scan_error: >-
+                  Application patch scanner failed (rc={{ scan_result.rc }}):
+                  {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
+                     | trim | truncate(300) }}
+
+        - name: Build eligible (application) package list
+          set_fact:
+            application_eligible: "{{ application_all_candidates | selectattr('is_application', 'equalto', true) | list }}"
+
+        - name: Report — nothing eligible to patch on this host
+          debug:
+            msg: >-
+              {{ application_scan_error if application_scan_error else
+                 (application_all_candidates | length) ~ ' pending update(s) on ' ~ inventory_hostname ~
+                 ', 0 classified as an approved application package (discovery_mode=' ~ discovery_mode ~ '). Nothing to do.' }}
+          when: (application_eligible | length) == 0
+
+        # ─────────────────────────────────────────────────────────────
+        # Apply — ONLY the classified application packages. Wrapped in
+        # block/rescue so a dependency conflict or install failure on
+        # one package is captured cleanly instead of aborting this
+        # host's run mid-way and skipping verification/reporting.
+        # ─────────────────────────────────────────────────────────────
+        - name: Apply application patches (failure-contained)
+          when: (application_eligible | length) > 0
+          block:
+            - name: "[Debian/Ubuntu/Kali] Install eligible application package updates"
+              apt:
+                name: "{{ application_eligible | map(attribute='name') | list }}"
+                state: latest
+                update_cache: no
+                install_recommends: no
+              register: apply_result_deb
+              check_mode: "{{ dry_run | bool }}"
+              when: ansible_os_family == "Debian"
+
+            # Generic `package` module (not distro-specific dnf5/dnf/yum
+            # modules): unlike the security-only playbook this doesn't
+            # need an advisory filter, just an explicit name list at
+            # state=latest — `package` transparently backs onto whichever
+            # of dnf5/dnf/yum ansible_pkg_mgr resolves to.
+            - name: "[AlmaLinux/Rocky/CentOS/RHEL/Amazon/Oracle] Install eligible application package updates"
+              package:
+                name: "{{ application_eligible | map(attribute='name') | list }}"
+                state: latest
+              register: apply_result_rh
+              check_mode: "{{ dry_run | bool }}"
+              when: ansible_os_family == "RedHat"
+
+            - name: Record whether anything changed
+              set_fact:
+                application_patched_changed: >-
+                  {{ (apply_result_deb.changed | default(false)) or (apply_result_rh.changed | default(false)) }}
+
+          rescue:
+            - name: Capture package installation failure (don't abort this host's run)
+              set_fact:
+                application_install_error: >-
+                  {{ (ansible_failed_result.msg | default('Package installation failed; see AWX job output for the failed task')) | truncate(500) }}
+                application_patched_changed: false
+
+            - name: Report installation failure and continue to verification/reporting steps
+              debug:
+                msg: "Application patch installation failed on {{ inventory_hostname }}: {{ application_install_error }}"
+
+      always:
+        - name: Remove remote scanner script
+          file:
+            path: "{{ remote_scanner }}"
+            state: absent
+          ignore_errors: yes
+
+    # ───────────────────────────────────────────────────────────────────
+    # Verify — only meaningful once packages have actually been applied.
+    # Checks each patched catalog application's known systemd unit(s),
+    # retrying a start if not active. Every distro here ships systemd,
+    # so no distro-specific service-manager branching is needed.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Verify service health after patching
       when:
-        - ansible_os_family in ['Debian', 'Kali']
-        - candidate_packages | length > 0
-      register: apt_result
+        - verify_services | bool
+        - not (dry_run | bool)
+        - (application_eligible | length) > 0
+      block:
+        - name: Determine catalog apps touched by this run
+          set_fact:
+            application_touched_apps: >-
+              {{
+                application_eligible
+                | map(attribute='catalog_app')
+                | select('string') | select('!=', '')
+                | unique | list
+              }}
 
-    - name: Upgrade candidate packages (RedHat family)
-      ansible.builtin.dnf:
-        name: "{{ item }}"
-        state: latest
-        update_only: true
-      loop: "{{ candidate_packages }}"
-      loop_control:
-        label: "{{ item }}"
+        - name: Resolve candidate service unit name patterns for touched apps
+          set_fact:
+            application_service_patterns: >-
+              {{
+                (application_touched_apps
+                 | map('extract', application_patch_catalog)
+                 | map(attribute='services', default=[])
+                 | list | sum(start=[]))
+                | unique
+              }}
+          when: (application_touched_apps | length) > 0
+
+        - name: Discover installed systemd unit names on this host
+          shell: |
+            set -o pipefail
+            systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | sed 's/\.service$//'
+          args:
+            executable: /bin/bash
+          register: application_all_units
+          changed_when: false
+          failed_when: false
+          when: (application_service_patterns | default([]) | length) > 0
+
+        - name: Match discovered units against the touched apps' service patterns
+          set_fact:
+            application_matched_services: >-
+              {{
+                application_all_units.stdout_lines | default([])
+                | select('match', '^(' ~ (application_service_patterns
+                                            | map('regex_replace', '\*', '.*')
+                                            | join('|')) ~ ')$')
+                | list
+              }}
+          when: (application_service_patterns | default([]) | length) > 0
+
+        - name: Check current status of matched services
+          systemd:
+            name: "{{ item }}"
+          register: application_service_status
+          loop: "{{ application_matched_services | default([]) }}"
+          failed_when: false
+
+        - name: Attempt to (re)start any matched service that isn't active
+          systemd:
+            name: "{{ item.item }}"
+            state: started
+          register: application_service_restart
+          loop: "{{ application_service_status.results | default([]) }}"
+          loop_control:
+            label: "{{ item.item }}"
+          when:
+            - item.status is defined
+            - (item.status.ActiveState | default('unknown')) != 'active'
+          retries: "{{ service_verify_retries }}"
+          delay: "{{ service_verify_delay }}"
+          until: application_service_restart is succeeded
+          failed_when: false
+
+        - name: Re-check final status of matched services
+          systemd:
+            name: "{{ item }}"
+          register: application_service_final
+          loop: "{{ application_matched_services | default([]) }}"
+          failed_when: false
+
+        - name: Build service verification report (name + final ActiveState)
+          set_fact:
+            application_service_report: >-
+              {{
+                (application_service_final.results | default([]))
+                | map(attribute='item')
+                | zip((application_service_final.results | default([]))
+                      | map(attribute='status.ActiveState', default='unknown'))
+                | map('list') | list
+              }}
+
+        - name: Report service verification results
+          debug:
+            msg: >-
+              Service '{{ item[0] }}' ActiveState = {{ item[1] }}
+              {{ '— WARNING: not active after restart attempt' if item[1] != 'active' else '' }}
+          loop: "{{ application_service_report | default([]) }}"
+          loop_control:
+            label: "{{ item[0] }}"
+
+    # ───────────────────────────────────────────────────────────────────
+    # Reboot — ONLY when explicitly requested. Never inferred from what
+    # was patched, unlike a kernel/security patch job.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Reboot host (explicitly requested only, via auto_reboot=true)
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Rebooting after application patch via AWX apply_application_patches_awx.yml (auto_reboot=true)"
       when:
-        - ansible_os_family == 'RedHat'
-        - candidate_packages | length > 0
-      register: dnf_result
+        - auto_reboot | bool
+        - not (dry_run | bool)
+        - application_patched_changed | bool
 
-    - name: Refresh package facts after patching
-      ansible.builtin.package_facts:
-        manager: auto
-      when: candidate_packages | length > 0
+    # ───────────────────────────────────────────────────────────────────
+    # Report + publish to AWX job stats — both per-host (for the AWX UI)
+    # and a single aggregated artifact in the second play below.
+    # ───────────────────────────────────────────────────────────────────
+    - name: Build application patch report fact
+      set_fact:
+        application_report_fact:
+          hostname: "{{ inventory_hostname }}"
+          timestamp: "{{ ansible_date_time.iso8601 }}"
+          dry_run: "{{ dry_run | bool }}"
+          discovery_mode: "{{ discovery_mode }}"
+          selective_application_list: "{{ application_list }}"
+          os_family: "{{ ansible_os_family }}"
+          distribution: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          total_pending_updates: "{{ application_all_candidates | default([]) | length }}"
+          application_updates_found: "{{ application_eligible | default([]) | length }}"
+          application_updates: "{{ application_eligible | default([]) }}"
+          skipped_updates: >-
+            {{
+              (application_all_candidates | default([]))
+              | rejectattr('is_application', 'equalto', true)
+              | list
+            }}
+          changed: "{{ application_patched_changed | default(false) }}"
+          install_error: "{{ application_install_error | default('') }}"
+          scan_error: "{{ application_scan_error | default('') }}"
+          services_verified: "{{ application_service_report | default([]) }}"
+          auto_reboot_requested: "{{ auto_reboot | bool }}"
+      when: generate_report | bool
 
-    - name: Determine which packages actually changed
-      ansible.builtin.set_fact:
-        changed_packages: >-
-          {{ (apt_result.results | default([]) + dnf_result.results | default([]))
-             | selectattr('changed', 'equalto', true) | map(attribute='item') | list }}
+    - name: Ensure remote report directory exists
+      file:
+        path: "{{ report_remote_dir }}"
+        state: directory
+        mode: "0750"
+      when: generate_report | bool
 
-    - name: Determine services to restart
-      ansible.builtin.set_fact:
-        services_to_restart: "{{ changed_packages | select('in', app_service_map.keys()) | map('extract', app_service_map) | unique | list }}"
+    - name: Write JSON report on remote host
+      copy:
+        content: "{{ application_report_fact | to_nice_json }}"
+        dest: "{{ report_remote_dir }}/application_patch_{{ inventory_hostname }}_{{ ansible_date_time.iso8601_basic_short }}.json"
+        mode: "0640"
+      register: application_report_file
+      when: generate_report | bool
 
-    - name: Refresh service facts
-      ansible.builtin.service_facts:
+    - name: Fetch JSON report back to the AWX/Ansible controller
+      fetch:
+        src: "{{ application_report_file.dest }}"
+        dest: "{{ report_local_dir }}/"
+        flat: true
       when:
-        - restart_services | bool
-        - services_to_restart | length > 0
+        - generate_report | bool
+        - report_fetch_to_controller | bool
 
-    - name: Restart services for upgraded packages
-      ansible.builtin.systemd:
-        name: "{{ item }}"
-        state: restarted
-      loop: "{{ services_to_restart }}"
-      loop_control:
-        label: "{{ item }}"
-      when:
-        - restart_services | bool
-        - item in ansible_facts.services
+    - name: Publish per-host application patch report to AWX job stats
+      set_stats:
+        per_host: true
+        data:
+          application_patch_report: "{{ application_report_fact }}"
+      when: generate_report | bool
 
-    - name: Show patch summary
-      ansible.builtin.debug:
+    - name: "Application patch summary: {{ inventory_hostname }}"
+      debug:
         msg:
-          - "Packages scanned: {{ candidate_packages | length }}"
-          - "Packages patched: {{ changed_packages | length }}"
-          - "Packages patched (names): {{ changed_packages }}"
-          - "Services restarted: {{ services_to_restart if (restart_services | bool) else [] }}"
+          - "=========== APPLICATION PATCH: {{ inventory_hostname }} ({{ ansible_host | default(inventory_hostname) }}) ==========="
+          - "Mode                  : {{ 'DRY RUN (nothing changed)' if (dry_run | bool) else 'APPLIED' }}"
+          - "Discovery mode        : {{ discovery_mode }}"
+          - "Pending updates (all) : {{ application_all_candidates | default([]) | length }}"
+          - "Application updates   : {{ application_eligible | default([]) | length }}"
+          - "Changed               : {{ application_patched_changed | default(false) }}"
+          - "Services verified     : {{ application_service_report | default([]) | length }}"
+          - "Install error         : {{ application_install_error | default('') or '(none)' }}"
+          - "Scan error            : {{ application_scan_error | default('') or '(none)' }}"
+          - "Report file (remote)  : {{ application_report_file.dest | default('n/a') }}"
+          - "======================================================================"
+
+    - name: "Application packages patched — {{ inventory_hostname }} ({{ application_eligible | default([]) | length }} total)"
+      debug:
+        msg: >-
+          {{ item.name }} [{{ item.catalog_app if item.catalog_app else 'auto-discovered' }}]:
+          {{ item.current_version }} -> {{ item.new_version }}
+      loop: "{{ application_eligible | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: (application_eligible | default([]) | length) > 0
+
+- name: Aggregate application patch reports into one reliable job-level artifact
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: no
+  tasks:
+    - name: Build fleet-wide aggregated application patch report
+      run_once: true
+      delegate_to: localhost
+      set_stats:
+        per_host: false
+        data:
+          application_patch_report_all: >-
+            {{
+              dict(ansible_play_hosts
+                   | zip(ansible_play_hosts | map('extract', hostvars, 'application_report_fact')))
+            }}
