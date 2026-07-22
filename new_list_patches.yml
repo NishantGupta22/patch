@@ -236,7 +236,7 @@
   gather_facts: yes
   become: yes
   vars:
-    remote_scanner: "/tmp/.patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
+    remote_scanner: "/var/tmp/.patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
 
     # Tunables
     patch_detail_limit:   500    # max packages eligible for changelog/CVE lookups (Debian)
@@ -260,7 +260,7 @@
     # fine. failed_when: false lets it keep going and scan against
     # whatever repos (i.e. the internet ones) actually responded.
     - name: "[Debian] Refresh apt cache — always, so the scan is accurate"
-      shell: |
+      ansible.builtin.shell: |
         set -o pipefail
         apt-get update -o Acquire::Retries=3
       args:
@@ -272,10 +272,17 @@
       failed_when: false
       timeout: "{{ patch_scan_timeout }}"
       register: apt_update_result
+      until: >-
+        apt_update_result.rc == 0 or
+        ('is locked' not in (apt_update_result.stderr | default('')) and
+         'Could not get lock' not in (apt_update_result.stderr | default('')))
+      retries: 5
+      delay: 15
       when: ansible_os_family == "Debian"
+      tags: [metadata]
 
     - name: "[Debian] Warn (non-fatal) if any repo failed to refresh"
-      debug:
+      ansible.builtin.debug:
         msg: >-
           apt-get update reported errors on {{ inventory_hostname }} — likely
           one or more unreachable/local repo entries in sources.list. Scan
@@ -286,10 +293,10 @@
         - ansible_os_family == "Debian"
         - apt_update_result.rc is defined
         - apt_update_result.rc != 0
-
+      tags: [metadata]
 
     - name: "[RedHat] Refresh package metadata — always, so the scan is accurate"
-      shell: |
+      ansible.builtin.shell: |
         set -e
         mgr=$(command -v dnf5 || command -v dnf || command -v yum)
         "$mgr" -q makecache
@@ -302,10 +309,17 @@
       failed_when: false
       timeout: "{{ patch_scan_timeout }}"
       register: rh_makecache
+      until: >-
+        rh_makecache.rc == 0 or
+        ('is locked' not in (rh_makecache.stderr | default('')) and
+         'Could not obtain lock' not in (rh_makecache.stderr | default('')))
+      retries: 5
+      delay: 15
       when: ansible_os_family == "RedHat"
+      tags: [metadata]
 
     - name: "[RedHat] Warn (non-fatal) if metadata refresh failed"
-      debug:
+      ansible.builtin.debug:
         msg: >-
           makecache reported errors on {{ inventory_hostname }} — likely
           one or more unreachable/local repo entries in *.repo files. Scan
@@ -316,25 +330,121 @@
         - ansible_os_family == "RedHat"
         - rh_makecache.rc is defined
         - rh_makecache.rc != 0
+      tags: [metadata]
 
     # ───────────────────────────────────────────────────────────────────────
-    # Initialize results (covers OS families we don't actively scan)
+    # Repository validation — if metadata refresh failed AND there are
+    # zero usable/enabled repos, scanning against a fully empty repo set
+    # would silently report "0 updates" instead of "we couldn't check".
+    # This distinguishes partial repo failure (tolerated, scan proceeds)
+    # from complete repo failure (scan_error set, scan skipped).
     # ───────────────────────────────────────────────────────────────────────
+    - name: "[Debian] Count enabled/usable repos"
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache policy | grep -c '^\s*[0-9]' || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: apt_repo_count
+      when: ansible_os_family == "Debian"
+      tags: [metadata, validation]
+
+    - name: "[RedHat] Count enabled repos"
+      ansible.builtin.shell: |
+        set -o pipefail
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q repolist enabled 2>/dev/null | tail -n +2 | grep -c . || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: rh_repo_count
+      when: ansible_os_family == "RedHat"
+      tags: [metadata, validation]
+
     - name: Initialize scan results
-      set_fact:
+      ansible.builtin.set_fact:
         all_patches: []
         scan_error: ""
         scan_warnings: []
+        repo_validation_failed: false
+      tags: [always]
+
+    - name: Flag complete repository failure (Debian) — fail scan rather than falsely report "0 updates"
+      ansible.builtin.set_fact:
+        scan_error: >-
+          No usable apt repositories were found on {{ inventory_hostname }} (metadata
+          refresh failed AND zero repos reported by apt-cache policy). Skipping scan
+          rather than risk reporting a false '0 updates' result.
+        repo_validation_failed: true
+      when:
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined and apt_update_result.rc != 0
+        - apt_repo_count.stdout is defined and (apt_repo_count.stdout | trim | int(default=0)) == 0
+      tags: [metadata, validation]
+
+    - name: Flag complete repository failure (RedHat) — fail scan rather than falsely report "0 updates"
+      ansible.builtin.set_fact:
+        scan_error: >-
+          No enabled dnf/yum repositories were found on {{ inventory_hostname }} (metadata
+          refresh failed AND zero repos reported by repolist). Skipping scan rather than
+          risk reporting a false '0 updates' result.
+        repo_validation_failed: true
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined and rh_makecache.rc != 0
+        - rh_repo_count.stdout is defined and (rh_repo_count.stdout | trim | int(default=0)) == 0
+      tags: [metadata, validation]
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Verify python3 is present before we try to copy/execute the scanner.
+    # Minimal/hardened images sometimes ship without a python interpreter
+    # at all — fail this host gracefully with a clear scan_error instead
+    # of an opaque "command not found" task failure.
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Check for a usable python3 interpreter on the target
+      ansible.builtin.command: "{{ patch_scanner_python }} --version"
+      changed_when: false
+      failed_when: false
+      register: python_check
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - not repo_validation_failed
+      tags: [validation]
+
+    - name: Flag missing python3 interpreter
+      ansible.builtin.set_fact:
+        scan_error: >-
+          '{{ patch_scanner_python }}' was not found or is not executable on
+          {{ inventory_hostname }}. This host may be a minimal/hardened image
+          with no python3 installed — the patch scanner cannot run without it.
+        repo_validation_failed: true
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - python_check is defined
+        - python_check.rc is defined
+        - python_check.rc != 0
+      tags: [validation]
+
+    - name: Start scan timer
+      ansible.builtin.set_fact:
+        scan_start_epoch: "{{ now(fmt='%s') | int }}"
+      tags: [always]
 
     # ───────────────────────────────────────────────────────────────────────
     # Run the bulk patch scanner (Debian/Ubuntu/Kali or RHEL family)
     # ───────────────────────────────────────────────────────────────────────
     - name: Scan for available patches
-      when: ansible_os_family in ['Debian', 'RedHat']
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - not repo_validation_failed
+      tags: [scan]
       block:
 
         - name: Copy patch scanner script to remote host
-          copy:
+          ansible.builtin.copy:
             dest: "{{ remote_scanner }}"
             mode: "0700"
             content: |
@@ -1330,7 +1440,7 @@
               {% endraw %}
 
         - name: Run patch scanner
-          command: >
+          ansible.builtin.command: >
             {{ patch_scanner_python }}
             {{ remote_scanner }}
             {{ ansible_os_family }}
@@ -1349,11 +1459,11 @@
 
         - name: Parse patch scanner output
           block:
-            - set_fact:
+            - ansible.builtin.set_fact:
                 all_patches:   "{{ (scan_result.stdout | from_json).patches | default([]) }}"
                 scan_warnings: "{{ (scan_result.stdout | from_json).warnings | default([]) }}"
           rescue:
-            - set_fact:
+            - ansible.builtin.set_fact:
                 all_patches: []
                 scan_warnings: []
                 scan_error: >-
@@ -1363,15 +1473,25 @@
 
       always:
         - name: Remove patch scanner script
-          file:
+          ansible.builtin.file:
             path:  "{{ remote_scanner }}"
             state: absent
           ignore_errors: yes
+          tags: [cleanup]
 
     - name: Note unsupported OS family
-      set_fact:
+      ansible.builtin.set_fact:
         scan_error: "Unsupported ansible_os_family '{{ ansible_os_family }}' — no patch scan performed"
-      when: ansible_os_family not in ['Debian', 'RedHat']
+      when:
+        - ansible_os_family not in ['Debian', 'RedHat']
+        - not repo_validation_failed
+      tags: [validation]
+
+    - name: Stop scan timer
+      ansible.builtin.set_fact:
+        scan_end_epoch: "{{ now(fmt='%s') | int }}"
+        scan_duration_seconds: "{{ (now(fmt='%s') | int) - (scan_start_epoch | int) }}"
+      tags: [always]
 
     # ───────────────────────────────────────────────────────────────────────
     # DISPLAY — shows the patch list directly in the AWX Job Output tab.
@@ -1400,29 +1520,31 @@
     #   "N/A" (Debian family — no equivalent taxonomy exists there).
     # ───────────────────────────────────────────────────────────────────────
     - name: Compute patch counts by category
-      set_fact:
+      ansible.builtin.set_fact:
         security_count:    "{{ all_patches | selectattr('display_category', 'equalto', 'SECURITY')    | list | length }}"
         bugfix_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'BUGFIX')      | list | length }}"
         enhancement_count: "{{ all_patches | selectattr('display_category', 'equalto', 'ENHANCEMENT') | list | length }}"
         system_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'SYSTEM')      | list | length }}"
       when: (all_patches | length) > 0
+      tags: [report]
 
     # FIX L — real per-host counts by CVE severity, straight from dnf/yum
     # advisory data (Debian patches all report severity "N/A" and simply
     # won't match any of these four buckets).
     - name: Compute patch counts by severity
-      set_fact:
+      ansible.builtin.set_fact:
         critical_count:  "{{ all_patches | selectattr('severity', 'equalto', 'Critical')  | list | length }}"
         important_count: "{{ all_patches | selectattr('severity', 'equalto', 'Important') | list | length }}"
         moderate_count:  "{{ all_patches | selectattr('severity', 'equalto', 'Moderate')  | list | length }}"
         low_count:       "{{ all_patches | selectattr('severity', 'equalto', 'Low')       | list | length }}"
       when: (all_patches | length) > 0
+      tags: [report]
 
     # Distinct CVE IDs across every pending patch on the host (any display
     # bucket), so "are there any CVEs here at all" has a single answer
     # without reading every package line.
     - name: Compute total distinct CVE count
-      set_fact:
+      ansible.builtin.set_fact:
         total_cve_count: >-
           {{
             (all_patches
@@ -1430,10 +1552,18 @@
              | selectattr('cves', 'ne', '')
              | map(attribute='cves') | map('split', ',') | sum(start=[]) | unique | length)
           }}
+        packages_with_cves: >-
+          {{
+            (all_patches
+             | selectattr('cves', 'defined')
+             | selectattr('cves', 'ne', '')
+             | list | length)
+          }}
       when: (all_patches | length) > 0
+      tags: [report]
 
     - name: "Patch summary: {{ inventory_hostname }}"
-      debug:
+      ansible.builtin.debug:
         msg:
           - "============== PATCH SUMMARY: {{ inventory_hostname }} =================="
           - "Security Updates   : {{ security_count }}"
@@ -1447,24 +1577,28 @@
           - "Severity Low       : {{ low_count }}"
           - "----------------------------------------------------------------"
           - "Distinct CVEs      : {{ total_cve_count }}"
+          - "Scan duration (s)  : {{ scan_duration_seconds }}"
           - "================================================================"
       when: (all_patches | length) > 0
+      tags: [report]
 
     - name: "Scan diagnostics: {{ inventory_hostname }}"
-      debug:
+      ansible.builtin.debug:
         msg: "{{ ['⚠ CVE/advisory data caveats for ' ~ inventory_hostname ~ ':'] + (scan_warnings | map('regex_replace', '^', '  - ') | list) }}"
       when: (scan_warnings | default([]) | length) > 0
+      tags: [report]
 
     - name: "Status: {{ inventory_hostname }}"
-      debug:
+      ansible.builtin.debug:
         msg: >-
           {{ ('SCAN ERROR: ' ~ scan_error)
              if scan_error
              else ('No pending patches on ' ~ inventory_hostname) }}
       when: (all_patches | length) == 0
+      tags: [report]
 
     - name: "Patch detail: {{ inventory_hostname }}"
-      debug:
+      ansible.builtin.debug:
         msg:
           - "===================================================="
           - "[{{ item.display_category }}] {{ item.name }}{{ ' (category: ' ~ item.category ~ ')' if item.category not in ['Security', 'Application'] else '' }}"
@@ -1483,6 +1617,7 @@
       loop: "{{ all_patches }}"
       loop_control:
         label: "{{ item.name }}"
+      tags: [report]
 
     # ───────────────────────────────────────────────────────────────────────
     # PUBLISH TO AWX — replaces the old write-JSON-then-fetch flow.
@@ -1490,9 +1625,13 @@
     # the AWX Job API (job artifacts / stats) with no shared filesystem
     # dependency between the execution node and any external caller
     # (e.g. your Flask app can just poll the AWX Job API).
+    #
+    # Also publishes lightweight execution metrics (scan_duration_seconds,
+    # packages_examined, packages_with_cves) so AWX dashboards/Workflow
+    # stats can track scan health/performance over time, not just results.
     # ───────────────────────────────────────────────────────────────────────
     - name: Publish patch report to AWX job stats
-      set_stats:
+      ansible.builtin.set_stats:
         per_host: true
         data:
           patch_report:
@@ -1502,6 +1641,9 @@
             kernel:        "{{ ansible_kernel }}"
             arch:          "{{ ansible_architecture }}"
             scan_time:     "{{ ansible_date_time.iso8601 }}"
+            scan_duration_seconds: "{{ scan_duration_seconds | default(0) }}"
+            packages_examined: "{{ all_patches | length }}"
+            packages_with_cves: "{{ packages_with_cves | default(0) }}"
             patch_count:   "{{ all_patches | length }}"
             security_count:    "{{ security_count | default(0) }}"
             bugfix_count:      "{{ bugfix_count | default(0) }}"
@@ -1515,3 +1657,4 @@
             patches:       "{{ all_patches }}"
             scan_error:    "{{ scan_error }}"
             scan_warnings: "{{ scan_warnings | default([]) }}"
+      tags: [always, report]
