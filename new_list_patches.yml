@@ -332,7 +332,10 @@
               ARCH_SUFFIX_RE = re.compile(
                   r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
               )
-              VER_REL_RE = re.compile(r"-[^-:]+-[^-:]+$")
+              # NOTE: FIX J removed the old VER_REL_RE regex-based NEVRA
+              # parsing entirely -- strip_nevra() below now uses a
+              # hyphen-count approach instead, which is correct for every
+              # NEVRA variant this scanner encounters. See its docstring.
 
 
               def run(cmd, timeout=180):
@@ -696,11 +699,40 @@
 
 
               def strip_nevra(nevra):
-                  """Strip arch suffix, version-release, and leading epoch from NEVRA."""
+                  """Extract the plain package name from a NEVRA-ish string.
+
+                  FIX J (review round 4, real root cause of "package correctly
+                  shown as SECURITY but CVEs always say 'none identified'"):
+                  the previous implementation used a regex tuned for the
+                  'name.arch' column check-update produces (epoch, when
+                  present, given in a SEPARATE column) and for the epoch-0-
+                  omitted style dnf/yum's `updateinfo list` prints
+                  (name-version-release.arch, no colon at all). Both of
+                  those it handled correctly. But the 'Packages:' listing
+                  inside `updateinfo info` / `advisory info` output uses the
+                  full COMPOUND NEVRA form name-epoch:version-release.arch
+                  (e.g. "dracut-0:057-117.git20260625.el9_8.x86_64") -- and
+                  the old code's final `.split(":")[0]` cut at the first
+                  colon ANYWHERE in the string, landing mid-name and turning
+                  "dracut" into "dracut-0". That mangled key never matched
+                  the plain package names from check-update, so CVE data for
+                  every such package was silently dropped even though it was
+                  parsed correctly moments earlier.
+
+                  Fix: RPM's spec forbids hyphens inside Version/Release
+                  fields, so after stripping the arch suffix, the package
+                  name is simply everything except the LAST TWO hyphen-
+                  separated segments (version, release) -- this holds
+                  regardless of whether an epoch is present, and regardless
+                  of whether it's attached as 'epoch:version' (compound
+                  NEVRA) or omitted/in a separate column. A bare 'name.arch'
+                  with nothing else attached (nothing left to strip) is
+                  returned unchanged.
+                  """
                   name = ARCH_SUFFIX_RE.sub("", nevra)
-                  name = VER_REL_RE.sub("", name)
-                  name = re.sub(r"^\d+:", "", name)
-                  name = name.split(":")[0]
+                  parts = name.split("-")
+                  if len(parts) >= 3:
+                      name = "-".join(parts[:-2])
                   return name
 
 
