@@ -124,24 +124,81 @@
 #   so it has a channel to report "couldn't verify" separately from
 #   "verified, found nothing" without breaking the existing patch schema.
 #
+# FIX J — [RHEL] NEVRA package-name extraction bug: `updateinfo info` /
+#   `advisory info` "Packages:" listings use the full compound NEVRA form
+#   name-epoch:version-release.arch (e.g.
+#   "dracut-0:057-117.git20260625.el9_8.x86_64"). The old strip_nevra()
+#   cut at the FIRST colon anywhere in the string, turning "dracut" into
+#   "dracut-0". Fixed by stripping the arch suffix and then dropping only
+#   the last two hyphen-separated segments (version, release) — RPM spec
+#   forbids hyphens inside those fields, so this is correct regardless of
+#   whether an epoch is present or how it's attached.
+#
+# FIX K — [RHEL] *** ROOT CAUSE of "I see CVEs when I run the command by
+#   hand, but the playbook reports none" *** :
+#   The previous scanner tried to learn which packages an advisory (and
+#   therefore its CVEs) applied to by reading a "Packages:"/"Affected
+#   Packages:" section back out of `updateinfo info security` /
+#   `advisory info --security` output. Real-world AlmaLinux/dnf5 builds
+#   (exactly the kind of output pasted in for this fix) do NOT print that
+#   section in `info` output at all — every advisory block goes straight
+#   from "CVEs:"/"Description:" to "Severity:" with no package listing.
+#   Because that section never existed for this host's dnf version, the
+#   old join always produced zero (package -> CVE) matches, silently, for
+#   every single package — the CVEs were real, dnf had them, the parser
+#   just had nothing to key them against.
+#
+#   Fixed by changing HOW CVEs are linked to packages: CVE-to-package
+#   linkage is now done via the advisory ID, not a packages list inside
+#   `info` output:
+#     1. `updateinfo list --available` (or dnf5's `advisory list
+#        --available`) is parsed once. Every line in this format ALWAYS
+#        pairs an advisory ID directly with the NEVRA of the package it
+#        affects — this column is never omitted, unlike the Packages:
+#        section in `info` output.
+#     2. `updateinfo info security --available` (or the dnf5 fallback)
+#        is parsed into {advisory_id: {cves, severity, type}}, using a
+#        block parser that also correctly walks the RHEL/AlmaLinux
+#        errata "multi-line field continuation" convention (a field's
+#        value can wrap onto indented lines that start with a bare ':'
+#        — the old parser only ever captured the FIRST CVE of any
+#        advisory listing more than one, because it never followed that
+#        continuation).
+#     3. Each package's final CVE list is the union of CVEs across every
+#        advisory ID that step 1 associated with it, looked up in step
+#        2's map. This never depends on a "Packages:" section existing.
+#
+# FIX L — [RHEL] real CVE severity (Critical / Important / Moderate /
+#   Low), not previously captured at all. Parsed from the same two
+#   sources FIX K already reads (the "Critical/Sec." style token that
+#   `updateinfo list` prints per package, cross-checked against the
+#   "Severity:" field and/or the boxed title line — e.g.
+#   "Critical: samba security update" — inside `updateinfo info`), so
+#   nothing new needs to be fetched. Each patch now carries a `severity`
+#   field (`Critical`/`Important`/`Moderate`/`Low`/`None`), and the
+#   playbook reports per-host counts by severity, all derived purely
+#   from what dnf/yum itself reports — nothing hardcoded.
+#
 # (All other design notes from the original bulk-scanner are unchanged:
 #  apt-cache policy for authoritative Debian versions, dnf/yum
-#  check-update section-aware parsing, robust updateinfo CVE parsing,
-#  distro-aware branching for Kali/Amazon/Oracle, always-valid-JSON
-#  scanner output, etc.)
+#  check-update section-aware parsing, distro-aware branching for
+#  Kali/Amazon/Oracle, always-valid-JSON scanner output, etc.)
 #
 # KNOWN LIMITATIONS (best-effort, not authoritative):
 #   - "Security" classification is heuristic for Debian (apt -security
 #     pocket / name patterns); not a substitute for a USN-database-backed
 #     audit. The `security_source` field exposes the confidence tier.
+#     Debian/apt has no equivalent Critical/Important/Moderate/Low
+#     severity taxonomy, so Debian patches report `severity: "N/A"`
+#     rather than a guessed value.
 #   - Debian/Ubuntu CVE extraction depends on network access to fetch
 #     package changelogs (`apt-get changelog`). On air-gapped hosts this
 #     will simply return no CVE data per package (never fails the scan);
 #     set `patch_fetch_cves: false` on such hosts to skip the attempt
 #     entirely rather than waiting out repeated timeouts.
-#   - RHEL family CVEs come from real `dnf/yum updateinfo` advisory data
-#     (no network round-trip per package) and are the more authoritative
-#     of the two.
+#   - RHEL family CVEs and severities come from real `dnf/yum
+#     updateinfo`/`advisory` advisory data (no network round-trip per
+#     package) and are the more authoritative of the two.
 #   - size_kb is estimated unpacked size, not download size.
 #   - SUSE/openSUSE (zypper) is not covered.
 #   - External CVE enrichment (OSV API / Ubuntu Security Notices API)
@@ -152,21 +209,27 @@
 #   patch_report: { hostname, ip, os, kernel, arch, scan_time,
 #                    patch_count, patches[], scan_error,
 #                    security_count, bugfix_count, enhancement_count,
-#                    system_count, total_cve_count }
+#                    system_count, total_cve_count,
+#                    critical_count, important_count, moderate_count,
+#                    low_count }
 #   each patch: { name, current_version, new_version, size_kb,
 #                 description, origin, category, display_category,
-#                 security_source, cves }
+#                 security_source, severity, cves }
 #   display_category is one of SECURITY / BUGFIX / ENHANCEMENT / SYSTEM —
 #   the coarse bucket used for AWX color-coding. RHEL family uses real
 #   dnf/yum advisory-type data for BUGFIX/ENHANCEMENT; Debian/Ubuntu has no
 #   equivalent metadata, so its non-security updates fall under SYSTEM —
 #   `category` (a finer-grained field) still distinguishes Kernel/Runtime/
-#   Library/System/Application within that bucket, and `cves` is
-#   populated for both Security and Kernel category packages regardless
-#   of which display bucket they land in.
+#   Library/System/Application within that bucket.
+#   `severity` is Critical/Important/Moderate/Low (RHEL family, from real
+#   advisory data) or "None" (RHEL, no security advisory) or "N/A"
+#   (Debian family, no equivalent metadata exists).
 #   total_cve_count is the number of DISTINCT CVE IDs across every
 #   pending patch on the host, for a quick "are there any CVEs here at
 #   all" answer without reading every package line.
+#   critical_count / important_count / moderate_count / low_count are
+#   per-host package counts broken out by severity, for a quick "how bad
+#   is this host" answer without reading every package line.
 
 - name: List Available Patches (AWX)
   hosts: "{{ target_hosts | default('all') }}"
@@ -309,6 +372,24 @@
               FIX H — [Kali] CVE eligibility broadened to all pending
                        packages, since Kali has no reliable -security
                        pocket signal to narrow the list with.
+              FIX J — [RHEL] strip_nevra() no longer mangles names that
+                       carry an epoch (compound NEVRA "name-epoch:ver-rel").
+              FIX K — [RHEL] *** the actual fix for "CVEs found by hand,
+                       none shown by the playbook" *** — CVE-to-package
+                       linkage no longer depends on a "Packages:" section
+                       inside `updateinfo info` output (many dnf5/AlmaLinux
+                       builds simply don't print one). Linkage is now done
+                       by joining on advisory ID between `updateinfo list`
+                       (which always pairs advisory_id <-> package NEVRA)
+                       and `updateinfo info security` (advisory_id -> CVEs).
+                       The info-block parser also now follows the RHEL
+                       errata multi-line field continuation convention, so
+                       advisories with more than one CVE no longer lose all
+                       but the first.
+              FIX L — [RHEL] real Critical/Important/Moderate/Low severity
+                       is now parsed and reported per package, from the
+                       same two calls FIX K already makes — nothing
+                       hardcoded, nothing extra fetched.
 
               Always exits 0 and prints valid JSON (possibly an empty
               patches list), even on unexpected errors, so the calling
@@ -332,10 +413,10 @@
               ARCH_SUFFIX_RE = re.compile(
                   r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
               )
-              # NOTE: FIX J removed the old VER_REL_RE regex-based NEVRA
-              # parsing entirely -- strip_nevra() below now uses a
-              # hyphen-count approach instead, which is correct for every
-              # NEVRA variant this scanner encounters. See its docstring.
+              # NOTE: NEVRA parsing uses a hyphen-count approach (see
+              # strip_nevra() below) rather than a version/release regex --
+              # this is correct for every NEVRA variant this scanner
+              # encounters, epoch or no epoch, compound or separate-column.
 
 
               def run(cmd, timeout=180):
@@ -680,6 +761,10 @@
                               # packages even though they display as SYSTEM.)
                               "display_category": "SECURITY" if category == "Security" else "SYSTEM",
                               "security_source": security_source,
+                              # Debian/apt has no Critical/Important/Moderate/
+                              # Low severity taxonomy like RHEL advisories --
+                              # report that plainly rather than guessing one.
+                              "severity":        "N/A",
                               "cves":            cves,
                           }
                       )
@@ -697,37 +782,34 @@
 
               RH_SKIP_UPDATEINFO_DISTROS = {"amazon", "amazonlinux", "oraclelinux", "oracle"}
 
+              SEVERITY_RANK = {"critical": 4, "important": 3, "moderate": 2, "low": 1}
+
+              # Matches the boxed title line dnf/yum prints above each advisory
+              # in `updateinfo info` output, e.g.:
+              #   "  Critical: samba security update"
+              #   "  Low: libtasn1 security update"
+              ADVISORY_TITLE_RE = re.compile(
+                  r"^\s*(Critical|Important|Moderate|Low|None)\s*:\s*(.+)$", re.I
+              )
+              ADVISORY_RULE_RE = re.compile(r"^=+$")
+
 
               def strip_nevra(nevra):
                   """Extract the plain package name from a NEVRA-ish string.
 
-                  FIX J (review round 4, real root cause of "package correctly
-                  shown as SECURITY but CVEs always say 'none identified'"):
-                  the previous implementation used a regex tuned for the
-                  'name.arch' column check-update produces (epoch, when
-                  present, given in a SEPARATE column) and for the epoch-0-
-                  omitted style dnf/yum's `updateinfo list` prints
-                  (name-version-release.arch, no colon at all). Both of
-                  those it handled correctly. But the 'Packages:' listing
-                  inside `updateinfo info` / `advisory info` output uses the
-                  full COMPOUND NEVRA form name-epoch:version-release.arch
-                  (e.g. "dracut-0:057-117.git20260625.el9_8.x86_64") -- and
-                  the old code's final `.split(":")[0]` cut at the first
-                  colon ANYWHERE in the string, landing mid-name and turning
-                  "dracut" into "dracut-0". That mangled key never matched
-                  the plain package names from check-update, so CVE data for
-                  every such package was silently dropped even though it was
-                  parsed correctly moments earlier.
-
-                  Fix: RPM's spec forbids hyphens inside Version/Release
-                  fields, so after stripping the arch suffix, the package
-                  name is simply everything except the LAST TWO hyphen-
-                  separated segments (version, release) -- this holds
-                  regardless of whether an epoch is present, and regardless
-                  of whether it's attached as 'epoch:version' (compound
-                  NEVRA) or omitted/in a separate column. A bare 'name.arch'
-                  with nothing else attached (nothing left to strip) is
-                  returned unchanged.
+                  FIX J: dnf/yum's 'Packages:'-style listings use the full
+                  compound NEVRA form name-epoch:version-release.arch (e.g.
+                  "dracut-0:057-117.git20260625.el9_8.x86_64"). A naive split
+                  on the first colon anywhere in the string lands mid-name
+                  (turning "dracut" into "dracut-0"). RPM's spec forbids
+                  hyphens inside Version/Release fields, so after stripping
+                  the arch suffix, the package name is simply everything
+                  except the LAST TWO hyphen-separated segments (version,
+                  release) -- this holds regardless of whether an epoch is
+                  present, and regardless of whether it's attached as
+                  'epoch:version' (compound NEVRA) or omitted/in a separate
+                  column. A bare 'name.arch' with nothing else attached
+                  (nothing left to strip) is returned unchanged.
                   """
                   name = ARCH_SUFFIX_RE.sub("", nevra)
                   parts = name.split("-")
@@ -871,106 +953,184 @@
                   return rc, out, err, "updateinfo (failed; not dnf5, no fallback available)"
 
 
-              def parse_updateinfo_cves(text):
+              def parse_updateinfo_list(text):
                   """
-                  Parse '<dnf|yum> updateinfo info security' output into
-                  {pkg_name: 'CVE-...,CVE-...'} without any per-package calls.
+                  Parse `<dnf|yum> updateinfo list --available` (or dnf5's
+                  `advisory list --available`) -- ALL advisories, not just
+                  security -- into:
+                      {pkg_name: {"advisory_ids": {...}, "types": {...},
+                                  "severities": {...}}}
+
+                  FIX K: this is also how CVE-to-package linkage is
+                  established. Every line in this format ALWAYS pairs an
+                  advisory_id directly with the affected package's NEVRA in
+                  the same row -- a column some dnf5/AlmaLinux builds'
+                  `updateinfo info` output omits entirely for the equivalent
+                  data. Joining package -> advisory_id -> CVEs (via
+                  parse_updateinfo_info_blocks) on advisory_id therefore
+                  never depends on that missing section.
+
+                  FIX L: severity (Critical/Important/Moderate/Low) is read
+                  from the same "Critical/Sec."-style type token dnf/yum
+                  prints in this listing, with no extra command needed.
+
+                  Typical line shape (dnf4/dnf5/yum-plugin-security all vary
+                  a little, but always end with the NEVRA and carry a
+                  type/severity token in the middle), e.g.:
+                      ALSA-2026:25049   Critical/Sec.   samba-4.20.1-6.el9_8.x86_64
+                      RHSA-2024:1234    Bugfix          pkg-1.2-3.el9.x86_64
                   """
-                  cve_map = {}
-                  cves, pkgs, in_pkgs = [], [], False
-
-                  BLOCK_SEP_RE   = re.compile(r"^(={3,}|(Name|Update\s*ID)\s*:)", re.I)
-                  CVE_FIELD_RE   = re.compile(r"^CVEs?\s*:\s*(.*)", re.I)
-                  CVE_BARE_RE    = re.compile(r"^(CVE-\d{4}-\d+)", re.I)
-                  PKG_HDR_RE     = re.compile(
-                      r"^(Updated|Affected|Fixed)\s+[Pp]ackages\s*:", re.I
-                  )
-                  FIELD_RE       = re.compile(r"^\w[\w\s]+\s*:")
-
-                  def flush():
-                      if cves and pkgs:
-                          for p in pkgs:
-                              n = strip_nevra(p)
-                              if n:
-                                  cve_map.setdefault(n, set()).update(cves)
-
-                  for raw in text.splitlines():
-                      line = raw.strip()
-                      if not line:
-                          continue
-
-                      if BLOCK_SEP_RE.match(line):
-                          flush()
-                          cves, pkgs, in_pkgs = [], [], False
-                          continue
-
-                      m = CVE_FIELD_RE.match(line)
-                      if m:
-                          cves += re.findall(r"CVE-\d{4}-\d+", m.group(1))
-                          continue
-
-                      if not in_pkgs and CVE_BARE_RE.match(line):
-                          cves += re.findall(r"CVE-\d{4}-\d+", line)
-                          continue
-
-                      if PKG_HDR_RE.match(line):
-                          in_pkgs = True
-                          continue
-
-                      if FIELD_RE.match(line) and not CVE_FIELD_RE.match(line):
-                          in_pkgs = False
-                          continue
-
-                      if in_pkgs and line:
-                          pkgs.append(line)
-
-                  flush()
-                  return {k: ",".join(sorted(v)) for k, v in cve_map.items()}
-
-
-              def parse_updateinfo_list_types(text):
-                  """
-                  Parse `<dnf|yum> updateinfo list --available` (ALL advisories,
-                  not just security) into {pkg_name: 'security'|'bugfix'|'enhancement'}.
-
-                  This gives Bugfix/Enhancement a REAL classification straight
-                  from dnf/yum's own advisory data, instead of guessing.
-                  Typical line shape (dnf4/dnf5/yum-plugin-security all vary a
-                  little, but always end with the NEVRA and have a type token
-                  somewhere in the middle, e.g.):
-                      FEDORA-2024-abcd   Security/Important   pkg-1.2-3.fc40.x86_64
-                      RHSA-2024:1234     Bugfix                pkg-1.2-3.el9.x86_64
-                  If a package shows up under more than one advisory type,
-                  'security' always wins (matches categorize_redhat's priority).
-                  """
+                  SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Updates Information", "Update ")
                   result = {}
                   for raw in text.splitlines():
                       line = raw.strip()
-                      if not line or line.startswith(("Last metadata", "Loaded plugins")):
+                      if not line or line.startswith(SKIP_PREFIXES):
                           continue
                       parts = line.split()
                       if len(parts) < 3:
                           continue
-                      type_field = parts[1].lower()
-                      pkg_field  = parts[-1]
-                      if "sec" in type_field:
-                          kind = "security"
-                      elif "bug" in type_field:
-                          kind = "bugfix"
-                      elif "enh" in type_field:
-                          kind = "enhancement"
-                      else:
+
+                      advisory_id, type_token, nevra = parts[0], parts[1], parts[-1]
+                      name = strip_nevra(nevra)
+                      if not name:
                           continue
-                      name = strip_nevra(pkg_field)
-                      if name and result.get(name) != "security":
-                          result[name] = kind
+
+                      severity, kind = None, None
+                      if "/" in type_token:
+                          sev_part, _, rest = type_token.partition("/")
+                          if sev_part.lower() in SEVERITY_RANK:
+                              severity = sev_part.title()
+                          if rest.lower().startswith("sec"):
+                              kind = "security"
+                      else:
+                          low = type_token.lower()
+                          if low.startswith("sec"):
+                              kind = "security"
+                          elif "bugfix" in low:
+                              kind = "bugfix"
+                          elif "enhancement" in low or "newpackage" in low:
+                              kind = "enhancement"
+
+                      entry = result.setdefault(
+                          name, {"advisory_ids": set(), "types": set(), "severities": set()}
+                      )
+                      entry["advisory_ids"].add(advisory_id)
+                      if kind:
+                          entry["types"].add(kind)
+                      if severity:
+                          entry["severities"].add(severity)
                   return result
+
+
+              def parse_updateinfo_info_blocks(text):
+                  """
+                  Parse `<dnf|yum> updateinfo info security --available` (or
+                  dnf5's `advisory info --security --available`) into:
+                      {advisory_id: {"cves": [...], "severity": str|None,
+                                     "type": str|None}}
+
+                  FIX K: deliberately does NOT try to read package names back
+                  out of this output -- some dnf5/AlmaLinux builds never print
+                  a "Packages:"/"Affected Packages:" section here at all, so
+                  relying on one silently drops every CVE. Package linkage is
+                  done separately in scan_redhat() by joining on advisory_id
+                  against parse_updateinfo_list(), which always has the NEVRA.
+
+                  FIX L: also captures the "Severity:" field and/or the boxed
+                  title line above each advisory (e.g.
+                  "Critical: samba security update") as a fallback, so
+                  severity is available even if one of the two is missing.
+
+                  Correctly follows the RHEL/AlmaLinux errata multi-line
+                  field continuation convention, where a field's value can
+                  wrap onto following lines that are indented and begin with
+                  a bare ':' :
+                      CVEs: CVE-2026-1933
+                          : CVE-2026-2340
+                          : CVE-2026-3012
+                  The previous version of this parser did not follow that
+                  continuation, so any advisory listing more than one CVE
+                  silently lost all but the first.
+                  """
+                  blocks = {}
+                  cur_id = None
+                  cur_field = None
+                  fields = {}
+                  pending_title_severity = None
+                  after_rule = False
+
+                  def flush():
+                      if cur_id:
+                          cve_text = fields.get("cves", "")
+                          cves = sorted(set(re.findall(r"CVE-\d{4}-\d+", cve_text)))
+                          severity = fields.get("severity") or fields.get("_title_severity")
+                          blocks[cur_id] = {
+                              "cves": cves,
+                              "severity": severity.title() if severity else None,
+                              "type": (fields.get("type") or "").strip().lower() or None,
+                          }
+
+                  for raw in text.splitlines():
+                      line = raw.rstrip("\n")
+                      stripped = line.strip()
+
+                      if ADVISORY_RULE_RE.match(stripped):
+                          after_rule = True
+                          continue
+
+                      if not stripped:
+                          after_rule = False
+                          continue
+
+                      if after_rule:
+                          title_m = ADVISORY_TITLE_RE.match(line)
+                          after_rule = False
+                          if title_m:
+                              pending_title_severity = title_m.group(1).title()
+                              continue
+
+                      field_m = re.match(r"^\s*([A-Za-z][A-Za-z0-9 ()/_-]*)\s*:\s*(.*)$", line)
+                      if field_m:
+                          label = field_m.group(1).strip().lower()
+                          value = field_m.group(2).strip()
+                          if label == "update id":
+                              flush()
+                              cur_id = value
+                              fields = (
+                                  {"_title_severity": pending_title_severity}
+                                  if pending_title_severity
+                                  else {}
+                              )
+                              pending_title_severity = None
+                              cur_field = None
+                              continue
+                          cur_field = label
+                          fields[cur_field] = (fields.get(cur_field, "") + " " + value).strip()
+                          continue
+
+                      cont_m = re.match(r"^\s*:\s*(.*)$", line)
+                      if cont_m and cur_field:
+                          fields[cur_field] = (
+                              fields.get(cur_field, "") + " " + cont_m.group(1)
+                          ).strip()
+                          continue
+
+                  flush()
+                  return blocks
+
+
+              def best_severity(severities):
+                  """Highest-ranked severity in a set, or None if empty/unknown."""
+                  ranked = [s for s in severities if s and s.lower() in SEVERITY_RANK]
+                  if not ranked:
+                      return None
+                  return max(ranked, key=lambda s: SEVERITY_RANK[s.lower()])
 
 
               def categorize_redhat(pkg, in_security_list):
                   """Returns (category, security_source) tuple."""
                   if in_security_list:
-                      return "Security", "updateinfo-list-security"
+                      return "Security", "updateinfo-list"
                   if RH_KERNEL_RE.match(pkg):
                       return "Kernel", "none"
                   if RH_RUNTIME_RE.match(pkg):
@@ -997,7 +1157,7 @@
                       warnings.append(
                           f"CVE/advisory data intentionally skipped for distro='{distro}' -- "
                           "its updateinfo format isn't reliable enough to trust here. Packages "
-                          "are still listed, but 'cves' will be empty and security "
+                          "are still listed, but 'cves'/'severity' will be empty and security "
                           "classification falls back to name/kernel heuristics only."
                       )
 
@@ -1018,42 +1178,38 @@
                   _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
                   installed = parse_pkg_info(inst_out, only_section="installed")
 
-                  security_pkgs = set()
-                  cve_map = {}
-                  update_types = {}
+                  pkg_meta = {}
+                  advisory_map = {}
 
                   if not skip_updateinfo:
-                      # FIX F/G — try 'updateinfo' then fall back to dnf5's
-                      # native 'advisory' syntax; check rc so a failure is
-                      # reported as a warning instead of silently looking
-                      # like "zero advisories found".
-                      rc_list, seclist_out, err_list, used_list = run_advisory_cmd(
+                      # FIX K/L — two calls, joined on advisory_id:
+                      #   1) 'updateinfo list --available'  -> pkg -> {advisory_ids, types, severities}
+                      #   2) 'updateinfo info security --available' -> advisory_id -> {cves, severity, type}
+                      # See the FIX K/L docstrings above for why this replaces
+                      # the old "Packages:"-section-inside-info-output approach.
+                      rc_list, list_out, err_list, used_list = run_advisory_cmd(
                           mgr,
-                          ["list", "security", "--available"],
-                          ["list", "--security", "--available"],
+                          ["list", "--available"],
+                          ["list", "--available"],
                       )
                       if rc_list != 0:
                           warnings.append(
-                              f"'{mgr} {used_list}' failed (rc={rc_list}) while listing security "
-                              "advisories -- CVE data could not be retrieved. Common causes: the "
-                              "updateinfo/advisory subcommand isn't available (dnf: install "
-                              "dnf-plugins-core; yum: install yum-utils) or the configured repos "
-                              "don't publish updateinfo/errata metadata. "
-                              f"Detail: {(err_list or '').strip()[:200]}"
+                              f"'{mgr} {used_list}' failed (rc={rc_list}) while listing advisories -- "
+                              "package type/severity/CVE linkage could not be established. Common "
+                              "causes: the updateinfo/advisory subcommand isn't available (dnf: "
+                              "install dnf-plugins-core; yum: install yum-utils) or the configured "
+                              f"repos don't publish updateinfo/errata metadata. Detail: {(err_list or '').strip()[:200]}"
                           )
                       else:
-                          for raw in seclist_out.splitlines():
-                              parts = raw.split()
-                              if len(parts) >= 3:
-                                  security_pkgs.add(strip_nevra(parts[-1]))
-                          if pkgs and not security_pkgs:
+                          pkg_meta = parse_updateinfo_list(list_out)
+                          if pkgs and not pkg_meta:
                               warnings.append(
-                                  "Security advisory listing ran successfully but returned no "
-                                  "advisories for any pending package on this host. If CVEs are "
-                                  "known to exist, this usually means the repo's updateinfo/errata "
-                                  "metadata is empty or not synced for this mirror (common on "
-                                  "CentOS Stream and some third-party/offline mirrors) rather than "
-                                  "a scan failure."
+                                  "Advisory listing ran successfully but returned no advisory data "
+                                  "at all for any pending package on this host. If CVEs are known "
+                                  "to exist (e.g. seen when running the equivalent command by hand), "
+                                  "this usually means the repo's updateinfo/errata metadata is empty "
+                                  "or not synced for this mirror (common on CentOS Stream and some "
+                                  "third-party/offline mirrors) rather than a scan failure."
                               )
 
                       rc_info, secinfo_out, err_info, used_info = run_advisory_cmd(
@@ -1062,27 +1218,14 @@
                           ["info", "--security", "--available"],
                       )
                       if rc_info == 0:
-                          cve_map = parse_updateinfo_cves(secinfo_out)
+                          advisory_map = parse_updateinfo_info_blocks(secinfo_out)
                       elif rc_list == 0:
-                          # The list call worked but info didn't -- packages
-                          # are correctly flagged Security, just without CVE
-                          # IDs attached. Worth a separate, more specific note.
                           warnings.append(
                               f"'{mgr} {used_info}' failed (rc={rc_info}) while fetching advisory "
-                              "detail -- security packages are correctly identified, but their "
-                              f"CVE IDs could not be retrieved. Detail: {(err_info or '').strip()[:200]}"
+                              "detail -- security packages are correctly identified from the "
+                              "advisory list, but their CVE IDs/severity could not be retrieved. "
+                              f"Detail: {(err_info or '').strip()[:200]}"
                           )
-
-                      # Bugfix/Enhancement classification (real advisory data,
-                      # not a guess). Best-effort: a failure here only means
-                      # non-security updates fall back to the SYSTEM bucket.
-                      rc_types, alltypes_out, _, _ = run_advisory_cmd(
-                          mgr,
-                          ["list", "--available"],
-                          ["list", "--available"],
-                      )
-                      if rc_types == 0:
-                          update_types = parse_updateinfo_list_types(alltypes_out)
 
                   def _fmt_version(info):
                       """
@@ -1109,22 +1252,32 @@
 
                       desc = a.get("Summary") or i.get("Summary") or ""
 
-                      category, security_source = categorize_redhat(
-                          pkg, pkg in security_pkgs
+                      meta = pkg_meta.get(
+                          pkg, {"advisory_ids": set(), "types": set(), "severities": set()}
                       )
-                      cves = cve_map.get(pkg, "")
+                      is_security = "security" in meta["types"]
+
+                      category, security_source = categorize_redhat(pkg, is_security)
+
+                      cve_set = set()
+                      for aid in meta["advisory_ids"]:
+                          info_block = advisory_map.get(aid)
+                          if info_block:
+                              cve_set.update(info_block["cves"])
+                      cves = ",".join(sorted(cve_set))
+
+                      severity = best_severity(meta["severities"]) or "None"
 
                       # display_category: coarse bucket used by the playbook
                       # for AWX color-coding. Uses REAL dnf/yum advisory type
-                      # data where available; anything with no matching
-                      # advisory (a plain package bump with no bugzilla/CVE
-                      # tied to it) falls back to SYSTEM.
-                      utype = update_types.get(pkg)
-                      if pkg in security_pkgs or utype == "security":
+                      # data; anything with no matching advisory (a plain
+                      # package bump with no bugzilla/CVE tied to it) falls
+                      # back to SYSTEM.
+                      if "security" in meta["types"]:
                           display_category = "SECURITY"
-                      elif utype == "bugfix":
+                      elif "bugfix" in meta["types"]:
                           display_category = "BUGFIX"
-                      elif utype == "enhancement":
+                      elif "enhancement" in meta["types"]:
                           display_category = "ENHANCEMENT"
                       else:
                           display_category = "SYSTEM"
@@ -1140,6 +1293,7 @@
                               "category":        category,
                               "display_category": display_category,
                               "security_source": security_source,
+                              "severity":        severity,
                               "cves":            cves,
                           }
                       )
@@ -1240,6 +1394,10 @@
     #   [SYSTEM]      everything else — incl. all non-security Debian/
     #                 Ubuntu updates, since apt has no equivalent bugfix/
     #                 enhancement metadata to draw on
+    #
+    #   severity is Critical/Important/Moderate/Low (RHEL, from real
+    #   advisory data), "None" (RHEL, no security advisory attached), or
+    #   "N/A" (Debian family — no equivalent taxonomy exists there).
     # ───────────────────────────────────────────────────────────────────────
     - name: Compute patch counts by category
       set_fact:
@@ -1247,6 +1405,17 @@
         bugfix_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'BUGFIX')      | list | length }}"
         enhancement_count: "{{ all_patches | selectattr('display_category', 'equalto', 'ENHANCEMENT') | list | length }}"
         system_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'SYSTEM')      | list | length }}"
+      when: (all_patches | length) > 0
+
+    # FIX L — real per-host counts by CVE severity, straight from dnf/yum
+    # advisory data (Debian patches all report severity "N/A" and simply
+    # won't match any of these four buckets).
+    - name: Compute patch counts by severity
+      set_fact:
+        critical_count:  "{{ all_patches | selectattr('severity', 'equalto', 'Critical')  | list | length }}"
+        important_count: "{{ all_patches | selectattr('severity', 'equalto', 'Important') | list | length }}"
+        moderate_count:  "{{ all_patches | selectattr('severity', 'equalto', 'Moderate')  | list | length }}"
+        low_count:       "{{ all_patches | selectattr('severity', 'equalto', 'Low')       | list | length }}"
       when: (all_patches | length) > 0
 
     # Distinct CVE IDs across every pending patch on the host (any display
@@ -1271,6 +1440,12 @@
           - "Bugfix Updates     : {{ bugfix_count }}"
           - "Enhancements       : {{ enhancement_count }}"
           - "System Updates     : {{ system_count }}"
+          - "----------------------------------------------------------------"
+          - "Severity Critical  : {{ critical_count }}"
+          - "Severity Important : {{ important_count }}"
+          - "Severity Moderate  : {{ moderate_count }}"
+          - "Severity Low       : {{ low_count }}"
+          - "----------------------------------------------------------------"
           - "Distinct CVEs      : {{ total_cve_count }}"
           - "================================================================"
       when: (all_patches | length) > 0
@@ -1293,16 +1468,17 @@
         msg:
           - "===================================================="
           - "[{{ item.display_category }}] {{ item.name }}{{ ' (category: ' ~ item.category ~ ')' if item.category not in ['Security', 'Application'] else '' }}"
-          - "Current: {{ item.current_version }}"
-          - "New    : {{ item.new_version }}"
+          - "Current : {{ item.current_version }}"
+          - "New     : {{ item.new_version }}"
+          - "Severity: {{ item.severity | default('None') }}"
           - >-
             {% set cve_list = item.cves.split(',') if item.cves else [] %}
             {%- if cve_list | length > 3 -%}
-            CVEs   : {{ cve_list[:3] | join(', ') }}, ... (+{{ cve_list | length - 3 }} more)
+            CVEs    : {{ cve_list[:3] | join(', ') }}, ... (+{{ cve_list | length - 3 }} more)
             {%- elif cve_list -%}
-            CVEs   : {{ cve_list | join(', ') }}
+            CVEs    : {{ cve_list | join(', ') }}
             {%- else -%}
-            CVEs   : none identified
+            CVEs    : none identified
             {%- endif %}
       loop: "{{ all_patches }}"
       loop_control:
@@ -1331,6 +1507,10 @@
             bugfix_count:      "{{ bugfix_count | default(0) }}"
             enhancement_count: "{{ enhancement_count | default(0) }}"
             system_count:      "{{ system_count | default(0) }}"
+            critical_count:    "{{ critical_count | default(0) }}"
+            important_count:   "{{ important_count | default(0) }}"
+            moderate_count:    "{{ moderate_count | default(0) }}"
+            low_count:         "{{ low_count | default(0) }}"
             total_cve_count:   "{{ total_cve_count | default(0) }}"
             patches:       "{{ all_patches }}"
             scan_error:    "{{ scan_error }}"
