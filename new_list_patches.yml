@@ -87,6 +87,43 @@
 #   line of defense — kernel CVEs occasionally ship outside the
 #   -security pocket (e.g. some LTS point-release kernel bumps).
 #
+# FIX F — [RHEL] dnf5 advisory-command fallback (review round 3, real
+#   root cause of "AlmaLinux/CentOS shows no CVEs"): on hosts where dnf5
+#   is the active package manager (increasingly the default on newer
+#   AlmaLinux 9.x / CentOS Stream builds), `updateinfo` was restructured
+#   into a different command family (`dnf5 advisory ...`), and dnf5 does
+#   not always ship the `updateinfo` compatibility alias. The scanner
+#   previously never checked the return code of the updateinfo calls, so
+#   a failed/unrecognized command on dnf5 looked identical to "ran fine,
+#   found zero advisories" — CVE data silently came back empty even
+#   though real advisories existed. The scanner now tries `updateinfo`
+#   first (works on dnf, yum, and any dnf5 build that does ship the
+#   compat shim) and automatically falls back to dnf5's native
+#   `advisory list/info --security` syntax when that fails and dnf5 is
+#   in use.
+#
+# FIX G — [RHEL] explicit scan diagnostics: return codes from every
+#   updateinfo/advisory call are now checked. A failure (missing
+#   command, missing dnf-plugins-core/yum-utils, unreachable repo) or an
+#   unexpected "ran fine but zero advisories for a host with pending
+#   updates" result now produces a `scan_warnings` entry surfaced in the
+#   AWX job output and stats, instead of silently reporting "no CVEs"
+#   indistinguishably from "we couldn't check."
+#
+# FIX H — [Debian/Kali] broadened CVE eligibility: since Kali has no
+#   reliable -security pocket signal (see FIX for the classification gap
+#   above), restricting CVE lookups to Security/Kernel category packages
+#   meant almost nothing ever qualified. On Kali only, CVE lookups are
+#   now attempted for ALL pending packages (still bounded by
+#   patch_detail_limit / patch_cve_workers / patch_cve_timeout like
+#   everywhere else), with a scan_warnings note explaining why Kali's
+#   security classification is heuristic-only.
+#
+# FIX I — scanner output schema change: the scanner now prints
+#   {"patches": [...], "warnings": [...]} instead of a bare patch array,
+#   so it has a channel to report "couldn't verify" separately from
+#   "verified, found nothing" without breaking the existing patch schema.
+#
 # (All other design notes from the original bulk-scanner are unchanged:
 #  apt-cache policy for authoritative Debian versions, dnf/yum
 #  check-update section-aware parsing, robust updateinfo CVE parsing,
@@ -224,6 +261,7 @@
       set_fact:
         all_patches: []
         scan_error: ""
+        scan_warnings: []
 
     # ───────────────────────────────────────────────────────────────────────
     # Run the bulk patch scanner (Debian/Ubuntu/Kali or RHEL family)
@@ -263,10 +301,19 @@
               FIX E — [Debian] CVE lookups run concurrently with a
                        realistic timeout, and are attempted for both
                        Security and Kernel category packages.
+              FIX F — [RHEL] dnf5 'advisory' command fallback when
+                       'updateinfo' is unavailable.
+              FIX G — [RHEL] updateinfo/advisory call failures and
+                       suspicious zero-CVE results are surfaced as
+                       warnings instead of silently looking like "no CVEs".
+              FIX H — [Kali] CVE eligibility broadened to all pending
+                       packages, since Kali has no reliable -security
+                       pocket signal to narrow the list with.
 
-              Always exits 0 and prints valid JSON (possibly "[]"), even on
-              unexpected errors, so the calling playbook can rely on parseable
-              output.
+              Always exits 0 and prints valid JSON (possibly an empty
+              patches list), even on unexpected errors, so the calling
+              playbook can rely on parseable output. Output schema (FIX I):
+                {"patches": [...], "warnings": [...]}
               """
 
               import concurrent.futures as cf
@@ -326,6 +373,15 @@
               # Matches a Debian changelog version-header line, e.g.:
               #   "linux (6.8.0-51.52) noble; urgency=medium"
               DEB_CHANGELOG_HEADER_RE = re.compile(r"^(\S+)\s+\(([^()]*)\)[^\n]*urgency", re.I)
+              KALI_SECURITY_NOTE = (
+                  "Kali has no stable '-security' pocket for apt-cache madison to key "
+                  "off of, so Security/Kernel classification here relies only on "
+                  "kernel-name, package-name, and Section heuristics -- weaker than "
+                  "Debian/Ubuntu. To compensate, CVE lookups are attempted for ALL "
+                  "pending packages on this host (not just ones classified Security/"
+                  "Kernel), bounded by patch_detail_limit/patch_cve_workers/"
+                  "patch_cve_timeout like everywhere else."
+              )
 
 
               def get_apt_policy(pkgs):
@@ -481,8 +537,13 @@
               def scan_debian(distro=""):
                   """
                   distro: ansible_distribution value, e.g. "Ubuntu", "Debian", "Kali".
+
+                  Returns (patches, warnings).
                   """
+                  warnings = []
                   is_kali = distro.lower() == "kali"
+                  if is_kali:
+                      warnings.append(KALI_SECURITY_NOTE)
 
                   # FIX A — no Always-Include-Phased-Updates override anymore.
                   # This means the list reflects ONLY what `apt upgrade` would
@@ -505,7 +566,7 @@
                       }
                   )
                   if not pkgs:
-                      return []
+                      return [], warnings
 
                   policy = get_apt_policy(pkgs)
 
@@ -549,9 +610,17 @@
                   # serially, even a modest pending set can turn a 900-second
                   # scan window into tens of minutes and silently starve out
                   # CVE data for whichever packages happen to be last in line.
-                  cve_eligible = [
-                      pkg for pkg in pkgs if classified[pkg][0] in ("Security", "Kernel")
-                  ][:DETAIL_LIMIT]
+                  # FIX H — on Kali, Security/Kernel classification is
+                  # heuristic-only (no -security pocket signal available),
+                  # so restricting CVE lookups to those categories would
+                  # leave almost everything unchecked. All pending packages
+                  # are eligible on Kali instead, still bounded the same way.
+                  if is_kali:
+                      cve_eligible = pkgs[:DETAIL_LIMIT]
+                  else:
+                      cve_eligible = [
+                          pkg for pkg in pkgs if classified[pkg][0] in ("Security", "Kernel")
+                      ][:DETAIL_LIMIT]
 
                   cves_by_pkg = {}
                   if FETCH_CVES and cve_eligible:
@@ -611,7 +680,7 @@
                               "cves":            cves,
                           }
                       )
-                  return results
+                  return results, warnings
 
 
               # ═══════════════════════════════════════════════════════════════
@@ -746,6 +815,30 @@
                   return result
 
 
+              def run_advisory_cmd(mgr, updateinfo_args, advisory_args, timeout=180):
+                  """
+                  FIX F — dnf5 restructured 'updateinfo' into a separate
+                  'advisory' command family and does not always ship the
+                  'updateinfo' compatibility alias (dnf5-plugins). Tries the
+                  classic '<mgr> updateinfo <updateinfo_args>' first (works
+                  on dnf, yum, and any dnf5 build that DOES ship the compat
+                  shim); if that fails and mgr is dnf5, retries with
+                  '<mgr> advisory <advisory_args>' (dnf5's native syntax).
+
+                  Returns (rc, stdout, stderr, note) where note records
+                  which command path actually ran/failed, for diagnostics.
+                  """
+                  rc, out, err = run([mgr, "-q", "updateinfo", *updateinfo_args], timeout=timeout)
+                  if rc == 0:
+                      return rc, out, err, "updateinfo"
+                  if os.path.basename(mgr) == "dnf5":
+                      rc2, out2, err2 = run([mgr, "-q", "advisory", *advisory_args], timeout=timeout)
+                      if rc2 == 0:
+                          return rc2, out2, err2, "advisory (dnf5 fallback)"
+                      return rc2, out2, err2, "advisory (dnf5 fallback, also failed)"
+                  return rc, out, err, "updateinfo (failed; not dnf5, no fallback available)"
+
+
               def parse_updateinfo_cves(text):
                   """
                   Parse '<dnf|yum> updateinfo info security' output into
@@ -859,20 +952,30 @@
                   """
                   distro: ansible_distribution value, e.g. "RedHat", "CentOS",
                   "AlmaLinux", "Rocky", "Amazon", "OracleLinux".
+
+                  Returns (patches, warnings).
                   """
+                  warnings = []
                   mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
                   if not mgr:
-                      return []
+                      return [], ["No supported package manager (dnf5/dnf/yum) found on this host."]
 
                   skip_updateinfo = distro.lower().replace(" ", "") in RH_SKIP_UPDATEINFO_DISTROS
+                  if skip_updateinfo:
+                      warnings.append(
+                          f"CVE/advisory data intentionally skipped for distro='{distro}' -- "
+                          "its updateinfo format isn't reliable enough to trust here. Packages "
+                          "are still listed, but 'cves' will be empty and security "
+                          "classification falls back to name/kernel heuristics only."
+                      )
 
                   rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
                   if rc not in (0, 100):
-                      return []
+                      return [], warnings
 
                   pkgs = parse_check_update(out)
                   if not pkgs:
-                      return []
+                      return [], warnings
 
                   # FIX B — 'info <pkgs>' can print BOTH Installed and Available
                   # stanzas for a package with a pending update; only_section
@@ -883,35 +986,71 @@
                   _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
                   installed = parse_pkg_info(inst_out, only_section="installed")
 
-                  _, seclist_out, _ = run(
-                      [mgr, "-q", "updateinfo", "list", "security", "--available"],
-                      timeout=180,
-                  )
                   security_pkgs = set()
-                  for raw in seclist_out.splitlines():
-                      parts = raw.split()
-                      if len(parts) >= 3:
-                          security_pkgs.add(strip_nevra(parts[-1]))
-
                   cve_map = {}
-                  if not skip_updateinfo:
-                      _, secinfo_out, _ = run(
-                          [mgr, "-q", "updateinfo", "info", "security", "--available"],
-                          timeout=180,
-                      )
-                      cve_map = parse_updateinfo_cves(secinfo_out)
-
-                  # Bugfix/Enhancement classification (real advisory data, not
-                  # a guess). Skipped on the same distros that skip security
-                  # updateinfo parsing, since their updateinfo format isn't
-                  # stable enough to trust here either.
                   update_types = {}
+
                   if not skip_updateinfo:
-                      _, alltypes_out, _ = run(
-                          [mgr, "-q", "updateinfo", "list", "--available"],
-                          timeout=180,
+                      # FIX F/G — try 'updateinfo' then fall back to dnf5's
+                      # native 'advisory' syntax; check rc so a failure is
+                      # reported as a warning instead of silently looking
+                      # like "zero advisories found".
+                      rc_list, seclist_out, err_list, used_list = run_advisory_cmd(
+                          mgr,
+                          ["list", "security", "--available"],
+                          ["list", "--security", "--available"],
                       )
-                      update_types = parse_updateinfo_list_types(alltypes_out)
+                      if rc_list != 0:
+                          warnings.append(
+                              f"'{mgr} {used_list}' failed (rc={rc_list}) while listing security "
+                              "advisories -- CVE data could not be retrieved. Common causes: the "
+                              "updateinfo/advisory subcommand isn't available (dnf: install "
+                              "dnf-plugins-core; yum: install yum-utils) or the configured repos "
+                              "don't publish updateinfo/errata metadata. "
+                              f"Detail: {(err_list or '').strip()[:200]}"
+                          )
+                      else:
+                          for raw in seclist_out.splitlines():
+                              parts = raw.split()
+                              if len(parts) >= 3:
+                                  security_pkgs.add(strip_nevra(parts[-1]))
+                          if pkgs and not security_pkgs:
+                              warnings.append(
+                                  "Security advisory listing ran successfully but returned no "
+                                  "advisories for any pending package on this host. If CVEs are "
+                                  "known to exist, this usually means the repo's updateinfo/errata "
+                                  "metadata is empty or not synced for this mirror (common on "
+                                  "CentOS Stream and some third-party/offline mirrors) rather than "
+                                  "a scan failure."
+                              )
+
+                      rc_info, secinfo_out, err_info, used_info = run_advisory_cmd(
+                          mgr,
+                          ["info", "security", "--available"],
+                          ["info", "--security", "--available"],
+                      )
+                      if rc_info == 0:
+                          cve_map = parse_updateinfo_cves(secinfo_out)
+                      elif rc_list == 0:
+                          # The list call worked but info didn't -- packages
+                          # are correctly flagged Security, just without CVE
+                          # IDs attached. Worth a separate, more specific note.
+                          warnings.append(
+                              f"'{mgr} {used_info}' failed (rc={rc_info}) while fetching advisory "
+                              "detail -- security packages are correctly identified, but their "
+                              f"CVE IDs could not be retrieved. Detail: {(err_info or '').strip()[:200]}"
+                          )
+
+                      # Bugfix/Enhancement classification (real advisory data,
+                      # not a guess). Best-effort: a failure here only means
+                      # non-security updates fall back to the SYSTEM bucket.
+                      rc_types, alltypes_out, _, _ = run_advisory_cmd(
+                          mgr,
+                          ["list", "--available"],
+                          ["list", "--available"],
+                      )
+                      if rc_types == 0:
+                          update_types = parse_updateinfo_list_types(alltypes_out)
 
                   def _fmt_version(info):
                       """
@@ -972,7 +1111,7 @@
                               "cves":            cves,
                           }
                       )
-                  return results
+                  return results, warnings
 
 
               # ═══════════════════════════════════════════════════════════════
@@ -983,17 +1122,21 @@
                   os_family = sys.argv[1] if len(sys.argv) > 1 else ""
                   distro    = sys.argv[2] if len(sys.argv) > 2 else ""
 
+                  patches, warnings = [], []
                   try:
                       if os_family == "Debian":
-                          patches = scan_debian(distro=distro)
+                          patches, warnings = scan_debian(distro=distro)
                       elif os_family == "RedHat":
-                          patches = scan_redhat(distro=distro)
+                          patches, warnings = scan_redhat(distro=distro)
                       else:
-                          patches = []
-                  except Exception:  # noqa: BLE001 — never crash; always emit valid JSON
-                      patches = []
+                          warnings = [f"Unsupported ansible_os_family '{os_family}'."]
+                  except Exception as exc:  # noqa: BLE001 — never crash; always emit valid JSON
+                      patches, warnings = [], [f"scanner crashed unexpectedly: {exc}"]
 
-                  print(json.dumps(patches))
+                  # FIX I — {"patches": [...], "warnings": [...]} instead of a
+                  # bare patch array, so "couldn't verify CVE data" has a
+                  # channel distinct from "verified, found nothing".
+                  print(json.dumps({"patches": patches, "warnings": warnings}))
 
 
               if __name__ == "__main__":
@@ -1021,10 +1164,12 @@
         - name: Parse patch scanner output
           block:
             - set_fact:
-                all_patches: "{{ scan_result.stdout | from_json }}"
+                all_patches:   "{{ (scan_result.stdout | from_json).patches | default([]) }}"
+                scan_warnings: "{{ (scan_result.stdout | from_json).warnings | default([]) }}"
           rescue:
             - set_fact:
                 all_patches: []
+                scan_warnings: []
                 scan_error: >-
                   Patch scanner failed (rc={{ scan_result.rc }}):
                   {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
@@ -1098,6 +1243,11 @@
           - "================================================================"
       when: (all_patches | length) > 0
 
+    - name: "Scan diagnostics: {{ inventory_hostname }}"
+      debug:
+        msg: "{{ ['⚠ CVE/advisory data caveats for ' ~ inventory_hostname ~ ':'] + (scan_warnings | map('regex_replace', '^', '  - ') | list) }}"
+      when: (scan_warnings | default([]) | length) > 0
+
     - name: "Status: {{ inventory_hostname }}"
       debug:
         msg: >-
@@ -1152,3 +1302,4 @@
             total_cve_count:   "{{ total_cve_count | default(0) }}"
             patches:       "{{ all_patches }}"
             scan_error:    "{{ scan_error }}"
+            scan_warnings: "{{ scan_warnings | default([]) }}"
