@@ -1,0 +1,1660 @@
+---
+# list_patches_awx.yml
+#
+# READ-ONLY SCAN. This playbook never installs, upgrades, or modifies any
+# package. It refreshes package metadata (equivalent to `apt update` /
+# `dnf makecache` — a metadata sync, not an install) and reports what is
+# available to patch — ONLY what is actually available on that specific
+# target host right now. Nothing here changes installed package state.
+#
+# AWX-NATIVE VERSION
+# -----------------------------------------------------------------------
+# This version is built to run as an AWX Job Template with no dependency
+# on a shared filesystem between the execution node and any external app
+# (e.g. Flask). AWX execution environments are ephemeral containers —
+# there is no guarantee `local_action`-written files or `fetch`-pulled
+# files land anywhere a caller can read them. So instead of writing a
+# JSON report to disk and fetching it back:
+#
+#   -> Results are published with the built-in `set_stats` module
+#      (per_host: true), which AWX captures as job artifacts/stats.
+#      Any caller (Flask, another Tower/AWX job, the AWX API) can pull
+#      the same data straight from the AWX Job API
+#      (/api/v2/jobs/<id>/stats/ or the job's artifacts field) —
+#      no shared disk path required.
+#   -> The AWX Job Output tab still shows a clean, human-readable
+#      per-host patch summary via `debug`, same as before.
+#
+# All file-writing / report_dir / fetch machinery from the standalone
+# version has been removed as unnecessary for AWX.
+#
+# Compatibility: Ubuntu / Debian / Kali (apt) and RHEL / CentOS / AlmaLinux /
+# Rocky / Amazon Linux / Oracle Linux (yum, dnf, or dnf5).
+#
+# FIXES APPLIED IN THIS VERSION
+# -----------------------------------------------------------------------
+# FIX A — "only patches actually available on THIS host" accuracy:
+#   Removed `APT::Get::Always-Include-Phased-Updates=true`. Ubuntu's
+#   phased-rollout mechanism intentionally holds some updates back from
+#   a % of machines at a time. Forcing phased updates to show made the
+#   report list patches that `apt upgrade` would NOT actually install on
+#   this host yet. Removing the override means the list now matches
+#   exactly what this machine would receive if patched right now.
+#
+# FIX B — RHEL/dnf/yum version mix-up bug:
+#   `dnf/yum info <pkgs>` (no qualifier) prints BOTH "Installed Packages"
+#   and "Available Packages" stanzas for any package with a pending
+#   update. The old parser wasn't section-aware and used whichever
+#   stanza appeared first (normally the Installed one) — so
+#   `new_version` could silently be wrong or equal to `current_version`.
+#   `parse_pkg_info()` is now section-aware (`only_section=`) so the
+#   "available" query only ever returns Available-Packages stanzas and
+#   the "installed" query only ever returns Installed-Packages stanzas.
+#
+# FIX C — [Debian] kernel-vs-security classification order (CVE-accuracy
+#   fix, review round 2): `categorize_debian()` used to check the kernel
+#   name pattern BEFORE checking security-pocket membership. Kernel CVEs
+#   are one of the most common things Ubuntu/Debian ship through the
+#   -security pocket, not an edge case — so any kernel package that was
+#   ALSO a security update was previously classified as "Kernel" instead
+#   of "Security". Since CVE lookups and the SECURITY display bucket both
+#   keyed off `category == "Security"`, this silently hid real CVE fixes
+#   for exactly the packages an operator most needs surfaced with their
+#   CVE IDs intact. Security-pocket membership is now checked first,
+#   ahead of the kernel-name match, for every distro.
+#
+# FIX D — [Debian] version-bounded CVE extraction (accuracy fix): the old
+#   `debian_cves()` regexed CVE IDs out of the ENTIRE `apt-get changelog`
+#   history for a package, which also picks up CVEs that were already
+#   fixed by versions the host has already installed — over-reporting
+#   what a pending update actually addresses. Debian/Ubuntu changelogs
+#   are newest-first; the parser now walks version blocks from the top
+#   and stops as soon as it reaches the block matching the *currently
+#   installed* version, so only CVEs mentioned in versions between what's
+#   installed now (exclusive) and the candidate (inclusive) are reported.
+#
+# FIX E — [Debian] concurrent, longer-timeout CVE lookups (accuracy +
+#   completeness fix): each CVE lookup is a network round-trip to
+#   changelogs.ubuntu.com / metadata.debian.net via `apt-get changelog`.
+#   The previous implementation ran these serially with a 6-second
+#   timeout; with `patch_detail_limit: 500` a host with a large pending
+#   set could take tens of minutes to scan, well past the scan timeout,
+#   and packages near the end of the list would silently come back with
+#   no CVE data — not because none exists, but because the scan never
+#   reached them. Lookups now run in a small thread pool (I/O-bound work,
+#   a good fit for threading) with a more realistic default timeout, and
+#   CVE eligibility now also includes the "Kernel" category as a second
+#   line of defense — kernel CVEs occasionally ship outside the
+#   -security pocket (e.g. some LTS point-release kernel bumps).
+#
+# FIX F — [RHEL] dnf5 advisory-command fallback (review round 3, real
+#   root cause of "AlmaLinux/CentOS shows no CVEs"): on hosts where dnf5
+#   is the active package manager (increasingly the default on newer
+#   AlmaLinux 9.x / CentOS Stream builds), `updateinfo` was restructured
+#   into a different command family (`dnf5 advisory ...`), and dnf5 does
+#   not always ship the `updateinfo` compatibility alias. The scanner
+#   previously never checked the return code of the updateinfo calls, so
+#   a failed/unrecognized command on dnf5 looked identical to "ran fine,
+#   found zero advisories" — CVE data silently came back empty even
+#   though real advisories existed. The scanner now tries `updateinfo`
+#   first (works on dnf, yum, and any dnf5 build that does ship the
+#   compat shim) and automatically falls back to dnf5's native
+#   `advisory list/info --security` syntax when that fails and dnf5 is
+#   in use.
+#
+# FIX G — [RHEL] explicit scan diagnostics: return codes from every
+#   updateinfo/advisory call are now checked. A failure (missing
+#   command, missing dnf-plugins-core/yum-utils, unreachable repo) or an
+#   unexpected "ran fine but zero advisories for a host with pending
+#   updates" result now produces a `scan_warnings` entry surfaced in the
+#   AWX job output and stats, instead of silently reporting "no CVEs"
+#   indistinguishably from "we couldn't check."
+#
+# FIX H — [Debian/Kali] broadened CVE eligibility: since Kali has no
+#   reliable -security pocket signal (see FIX for the classification gap
+#   above), restricting CVE lookups to Security/Kernel category packages
+#   meant almost nothing ever qualified. On Kali only, CVE lookups are
+#   now attempted for ALL pending packages (still bounded by
+#   patch_detail_limit / patch_cve_workers / patch_cve_timeout like
+#   everywhere else), with a scan_warnings note explaining why Kali's
+#   security classification is heuristic-only.
+#
+# FIX I — scanner output schema change: the scanner now prints
+#   {"patches": [...], "warnings": [...]} instead of a bare patch array,
+#   so it has a channel to report "couldn't verify" separately from
+#   "verified, found nothing" without breaking the existing patch schema.
+#
+# FIX J — [RHEL] NEVRA package-name extraction bug: `updateinfo info` /
+#   `advisory info` "Packages:" listings use the full compound NEVRA form
+#   name-epoch:version-release.arch (e.g.
+#   "dracut-0:057-117.git20260625.el9_8.x86_64"). The old strip_nevra()
+#   cut at the FIRST colon anywhere in the string, turning "dracut" into
+#   "dracut-0". Fixed by stripping the arch suffix and then dropping only
+#   the last two hyphen-separated segments (version, release) — RPM spec
+#   forbids hyphens inside those fields, so this is correct regardless of
+#   whether an epoch is present or how it's attached.
+#
+# FIX K — [RHEL] *** ROOT CAUSE of "I see CVEs when I run the command by
+#   hand, but the playbook reports none" *** :
+#   The previous scanner tried to learn which packages an advisory (and
+#   therefore its CVEs) applied to by reading a "Packages:"/"Affected
+#   Packages:" section back out of `updateinfo info security` /
+#   `advisory info --security` output. Real-world AlmaLinux/dnf5 builds
+#   (exactly the kind of output pasted in for this fix) do NOT print that
+#   section in `info` output at all — every advisory block goes straight
+#   from "CVEs:"/"Description:" to "Severity:" with no package listing.
+#   Because that section never existed for this host's dnf version, the
+#   old join always produced zero (package -> CVE) matches, silently, for
+#   every single package — the CVEs were real, dnf had them, the parser
+#   just had nothing to key them against.
+#
+#   Fixed by changing HOW CVEs are linked to packages: CVE-to-package
+#   linkage is now done via the advisory ID, not a packages list inside
+#   `info` output:
+#     1. `updateinfo list --available` (or dnf5's `advisory list
+#        --available`) is parsed once. Every line in this format ALWAYS
+#        pairs an advisory ID directly with the NEVRA of the package it
+#        affects — this column is never omitted, unlike the Packages:
+#        section in `info` output.
+#     2. `updateinfo info security --available` (or the dnf5 fallback)
+#        is parsed into {advisory_id: {cves, severity, type}}, using a
+#        block parser that also correctly walks the RHEL/AlmaLinux
+#        errata "multi-line field continuation" convention (a field's
+#        value can wrap onto indented lines that start with a bare ':'
+#        — the old parser only ever captured the FIRST CVE of any
+#        advisory listing more than one, because it never followed that
+#        continuation).
+#     3. Each package's final CVE list is the union of CVEs across every
+#        advisory ID that step 1 associated with it, looked up in step
+#        2's map. This never depends on a "Packages:" section existing.
+#
+# FIX L — [RHEL] real CVE severity (Critical / Important / Moderate /
+#   Low), not previously captured at all. Parsed from the same two
+#   sources FIX K already reads (the "Critical/Sec." style token that
+#   `updateinfo list` prints per package, cross-checked against the
+#   "Severity:" field and/or the boxed title line — e.g.
+#   "Critical: samba security update" — inside `updateinfo info`), so
+#   nothing new needs to be fetched. Each patch now carries a `severity`
+#   field (`Critical`/`Important`/`Moderate`/`Low`/`None`), and the
+#   playbook reports per-host counts by severity, all derived purely
+#   from what dnf/yum itself reports — nothing hardcoded.
+#
+# (All other design notes from the original bulk-scanner are unchanged:
+#  apt-cache policy for authoritative Debian versions, dnf/yum
+#  check-update section-aware parsing, distro-aware branching for
+#  Kali/Amazon/Oracle, always-valid-JSON scanner output, etc.)
+#
+# KNOWN LIMITATIONS (best-effort, not authoritative):
+#   - "Security" classification is heuristic for Debian (apt -security
+#     pocket / name patterns); not a substitute for a USN-database-backed
+#     audit. The `security_source` field exposes the confidence tier.
+#     Debian/apt has no equivalent Critical/Important/Moderate/Low
+#     severity taxonomy, so Debian patches report `severity: "N/A"`
+#     rather than a guessed value.
+#   - Debian/Ubuntu CVE extraction depends on network access to fetch
+#     package changelogs (`apt-get changelog`). On air-gapped hosts this
+#     will simply return no CVE data per package (never fails the scan);
+#     set `patch_fetch_cves: false` on such hosts to skip the attempt
+#     entirely rather than waiting out repeated timeouts.
+#   - RHEL family CVEs and severities come from real `dnf/yum
+#     updateinfo`/`advisory` advisory data (no network round-trip per
+#     package) and are the more authoritative of the two.
+#   - size_kb is estimated unpacked size, not download size.
+#   - SUSE/openSUSE (zypper) is not covered.
+#   - External CVE enrichment (OSV API / Ubuntu Security Notices API)
+#     should be done downstream (e.g. by whatever consumes the AWX
+#     job stats), not here.
+#
+# Per-host stat schema (available via AWX job stats/artifacts):
+#   patch_report: { hostname, ip, os, kernel, arch, scan_time,
+#                    patch_count, patches[], scan_error,
+#                    security_count, bugfix_count, enhancement_count,
+#                    system_count, total_cve_count,
+#                    critical_count, important_count, moderate_count,
+#                    low_count }
+#   each patch: { name, current_version, new_version, size_kb,
+#                 description, origin, category, display_category,
+#                 security_source, severity, cves }
+#   display_category is one of SECURITY / BUGFIX / ENHANCEMENT / SYSTEM —
+#   the coarse bucket used for AWX color-coding. RHEL family uses real
+#   dnf/yum advisory-type data for BUGFIX/ENHANCEMENT; Debian/Ubuntu has no
+#   equivalent metadata, so its non-security updates fall under SYSTEM —
+#   `category` (a finer-grained field) still distinguishes Kernel/Runtime/
+#   Library/System/Application within that bucket.
+#   `severity` is Critical/Important/Moderate/Low (RHEL family, from real
+#   advisory data) or "None" (RHEL, no security advisory) or "N/A"
+#   (Debian family, no equivalent metadata exists).
+#   total_cve_count is the number of DISTINCT CVE IDs across every
+#   pending patch on the host, for a quick "are there any CVEs here at
+#   all" answer without reading every package line.
+#   critical_count / important_count / moderate_count / low_count are
+#   per-host package counts broken out by severity, for a quick "how bad
+#   is this host" answer without reading every package line.
+
+- name: List Available Patches (AWX)
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: yes
+  become: yes
+  vars:
+    remote_scanner: "/var/tmp/.patch_scanner_{{ ansible_date_time.epoch }}_{{ inventory_hostname }}.py"
+
+    # Tunables
+    patch_detail_limit:   500    # max packages eligible for changelog/CVE lookups (Debian)
+    patch_fetch_cves:     true   # set false on air-gapped hosts (avoids apt-get changelog)
+    patch_cve_timeout:    20     # seconds per apt-get changelog lookup (network-bound; FIX E)
+    patch_cve_workers:    8      # concurrent CVE lookup workers, Debian only (FIX E)
+    patch_scan_timeout:   900    # seconds; generous cap for metadata refresh + scan
+    patch_scanner_python: "/usr/bin/python3"
+
+  tasks:
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Always refresh package metadata so the scan is accurate
+    # (metadata sync only — this does NOT install or upgrade anything)
+    # ───────────────────────────────────────────────────────────────────────
+    # NOTE: uses a raw `apt-get update` (not the `apt:` module's
+    # update_cache: yes) on purpose. The apt module treats ANY repo
+    # failing to refresh as a hard task failure — so a single stale/
+    # unreachable local repo entry in sources.list would previously
+    # abort the whole scan even though every real internet repo synced
+    # fine. failed_when: false lets it keep going and scan against
+    # whatever repos (i.e. the internet ones) actually responded.
+    - name: "[Debian] Refresh apt cache — always, so the scan is accurate"
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-get update -o Acquire::Retries=3
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+        LANG: C
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: apt_update_result
+      until: >-
+        apt_update_result.rc == 0 or
+        ('is locked' not in (apt_update_result.stderr | default('')) and
+         'Could not get lock' not in (apt_update_result.stderr | default('')))
+      retries: 5
+      delay: 15
+      when: ansible_os_family == "Debian"
+      tags: [metadata]
+
+    - name: "[Debian] Warn (non-fatal) if any repo failed to refresh"
+      ansible.builtin.debug:
+        msg: >-
+          apt-get update reported errors on {{ inventory_hostname }} — likely
+          one or more unreachable/local repo entries in sources.list. Scan
+          will continue using whatever repos (internet ones) did refresh.
+          Details: {{ (apt_update_result.stderr | default('') + ' ' + apt_update_result.stdout | default(''))
+                       | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined
+        - apt_update_result.rc != 0
+      tags: [metadata]
+
+    - name: "[RedHat] Refresh package metadata — always, so the scan is accurate"
+      ansible.builtin.shell: |
+        set -e
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q makecache
+      args:
+        executable: /bin/bash
+      environment:
+        LC_ALL: C
+        LANG: C
+      changed_when: false
+      failed_when: false
+      timeout: "{{ patch_scan_timeout }}"
+      register: rh_makecache
+      until: >-
+        rh_makecache.rc == 0 or
+        ('is locked' not in (rh_makecache.stderr | default('')) and
+         'Could not obtain lock' not in (rh_makecache.stderr | default('')))
+      retries: 5
+      delay: 15
+      when: ansible_os_family == "RedHat"
+      tags: [metadata]
+
+    - name: "[RedHat] Warn (non-fatal) if metadata refresh failed"
+      ansible.builtin.debug:
+        msg: >-
+          makecache reported errors on {{ inventory_hostname }} — likely
+          one or more unreachable/local repo entries in *.repo files. Scan
+          will continue using whatever repos (internet ones) did refresh.
+          Details: {{ (rh_makecache.stderr | default('') + ' ' + rh_makecache.stdout | default(''))
+                       | trim | truncate(400) }}
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined
+        - rh_makecache.rc != 0
+      tags: [metadata]
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Repository validation — if metadata refresh failed AND there are
+    # zero usable/enabled repos, scanning against a fully empty repo set
+    # would silently report "0 updates" instead of "we couldn't check".
+    # This distinguishes partial repo failure (tolerated, scan proceeds)
+    # from complete repo failure (scan_error set, scan skipped).
+    # ───────────────────────────────────────────────────────────────────────
+    - name: "[Debian] Count enabled/usable repos"
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-cache policy | grep -c '^\s*[0-9]' || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: apt_repo_count
+      when: ansible_os_family == "Debian"
+      tags: [metadata, validation]
+
+    - name: "[RedHat] Count enabled repos"
+      ansible.builtin.shell: |
+        set -o pipefail
+        mgr=$(command -v dnf5 || command -v dnf || command -v yum)
+        "$mgr" -q repolist enabled 2>/dev/null | tail -n +2 | grep -c . || true
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+      register: rh_repo_count
+      when: ansible_os_family == "RedHat"
+      tags: [metadata, validation]
+
+    - name: Initialize scan results
+      ansible.builtin.set_fact:
+        all_patches: []
+        scan_error: ""
+        scan_warnings: []
+        repo_validation_failed: false
+      tags: [always]
+
+    - name: Flag complete repository failure (Debian) — fail scan rather than falsely report "0 updates"
+      ansible.builtin.set_fact:
+        scan_error: >-
+          No usable apt repositories were found on {{ inventory_hostname }} (metadata
+          refresh failed AND zero repos reported by apt-cache policy). Skipping scan
+          rather than risk reporting a false '0 updates' result.
+        repo_validation_failed: true
+      when:
+        - ansible_os_family == "Debian"
+        - apt_update_result.rc is defined and apt_update_result.rc != 0
+        - apt_repo_count.stdout is defined and (apt_repo_count.stdout | trim | int(default=0)) == 0
+      tags: [metadata, validation]
+
+    - name: Flag complete repository failure (RedHat) — fail scan rather than falsely report "0 updates"
+      ansible.builtin.set_fact:
+        scan_error: >-
+          No enabled dnf/yum repositories were found on {{ inventory_hostname }} (metadata
+          refresh failed AND zero repos reported by repolist). Skipping scan rather than
+          risk reporting a false '0 updates' result.
+        repo_validation_failed: true
+      when:
+        - ansible_os_family == "RedHat"
+        - rh_makecache.rc is defined and rh_makecache.rc != 0
+        - rh_repo_count.stdout is defined and (rh_repo_count.stdout | trim | int(default=0)) == 0
+      tags: [metadata, validation]
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Verify python3 is present before we try to copy/execute the scanner.
+    # Minimal/hardened images sometimes ship without a python interpreter
+    # at all — fail this host gracefully with a clear scan_error instead
+    # of an opaque "command not found" task failure.
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Check for a usable python3 interpreter on the target
+      ansible.builtin.command: "{{ patch_scanner_python }} --version"
+      changed_when: false
+      failed_when: false
+      register: python_check
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - not repo_validation_failed
+      tags: [validation]
+
+    - name: Flag missing python3 interpreter
+      ansible.builtin.set_fact:
+        scan_error: >-
+          '{{ patch_scanner_python }}' was not found or is not executable on
+          {{ inventory_hostname }}. This host may be a minimal/hardened image
+          with no python3 installed — the patch scanner cannot run without it.
+        repo_validation_failed: true
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - python_check is defined
+        - python_check.rc is defined
+        - python_check.rc != 0
+      tags: [validation]
+
+    - name: Start scan timer
+      ansible.builtin.set_fact:
+        scan_start_epoch: "{{ now(fmt='%s') | int }}"
+      tags: [always]
+
+    # ───────────────────────────────────────────────────────────────────────
+    # Run the bulk patch scanner (Debian/Ubuntu/Kali or RHEL family)
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Scan for available patches
+      when:
+        - ansible_os_family in ['Debian', 'RedHat']
+        - not repo_validation_failed
+      tags: [scan]
+      block:
+
+        - name: Copy patch scanner script to remote host
+          ansible.builtin.copy:
+            dest: "{{ remote_scanner }}"
+            mode: "0700"
+            content: |
+              {% raw %}
+              #!/usr/bin/env python3
+              """
+              patch_scanner.py — AWX version
+
+              Scans a host for available package updates (Debian/apt family or
+              RHEL/dnf/dnf5/yum family) and prints a JSON array of patch objects
+              to stdout. This script never installs or modifies packages.
+
+              Usage: patch_scanner.py <ansible_os_family> [ansible_distribution]
+
+              FIX A — phased-update override removed: report reflects only
+                       what is actually installable on THIS host right now.
+              FIX B — section-aware RHEL info parsing: 'available' vs
+                       'installed' stanzas are never mixed up.
+              FIX C — [Debian] security-pocket membership is checked BEFORE
+                       the kernel-name match in categorize_debian(), so a
+                       kernel package that is also a security update is
+                       correctly classified (and CVE-checked) as Security.
+              FIX D — [Debian] CVE extraction from `apt-get changelog` is
+                       bounded to versions newer than what's installed, so
+                       already-fixed CVEs from old changelog entries are
+                       never reported as pending.
+              FIX E — [Debian] CVE lookups run concurrently with a
+                       realistic timeout, and are attempted for both
+                       Security and Kernel category packages.
+              FIX F — [RHEL] dnf5 'advisory' command fallback when
+                       'updateinfo' is unavailable.
+              FIX G — [RHEL] updateinfo/advisory call failures and
+                       suspicious zero-CVE results are surfaced as
+                       warnings instead of silently looking like "no CVEs".
+              FIX H — [Kali] CVE eligibility broadened to all pending
+                       packages, since Kali has no reliable -security
+                       pocket signal to narrow the list with.
+              FIX J — [RHEL] strip_nevra() no longer mangles names that
+                       carry an epoch (compound NEVRA "name-epoch:ver-rel").
+              FIX K — [RHEL] *** the actual fix for "CVEs found by hand,
+                       none shown by the playbook" *** — CVE-to-package
+                       linkage no longer depends on a "Packages:" section
+                       inside `updateinfo info` output (many dnf5/AlmaLinux
+                       builds simply don't print one). Linkage is now done
+                       by joining on advisory ID between `updateinfo list`
+                       (which always pairs advisory_id <-> package NEVRA)
+                       and `updateinfo info security` (advisory_id -> CVEs).
+                       The info-block parser also now follows the RHEL
+                       errata multi-line field continuation convention, so
+                       advisories with more than one CVE no longer lose all
+                       but the first.
+              FIX L — [RHEL] real Critical/Important/Moderate/Low severity
+                       is now parsed and reported per package, from the
+                       same two calls FIX K already makes — nothing
+                       hardcoded, nothing extra fetched.
+
+              Always exits 0 and prints valid JSON (possibly an empty
+              patches list), even on unexpected errors, so the calling
+              playbook can rely on parseable output. Output schema (FIX I):
+                {"patches": [...], "warnings": [...]}
+              """
+
+              import concurrent.futures as cf
+              import json
+              import os
+              import re
+              import shutil
+              import subprocess
+              import sys
+
+              DETAIL_LIMIT = int(os.environ.get("PATCH_DETAIL_LIMIT", "500"))
+              FETCH_CVES   = os.environ.get("PATCH_FETCH_CVES", "1").lower() not in ("0", "false", "no")
+              CVE_TIMEOUT  = int(os.environ.get("PATCH_CVE_TIMEOUT", "20"))
+              CVE_WORKERS  = max(1, int(os.environ.get("PATCH_CVE_WORKERS", "8")))
+
+              ARCH_SUFFIX_RE = re.compile(
+                  r"\.(x86_64|i[3-6]86|noarch|aarch64|armv7hl|s390x|ppc64le|ppc64)$"
+              )
+              # NOTE: NEVRA parsing uses a hyphen-count approach (see
+              # strip_nevra() below) rather than a version/release regex --
+              # this is correct for every NEVRA variant this scanner
+              # encounters, epoch or no epoch, compound or separate-column.
+
+
+              def run(cmd, timeout=180):
+                  """Run a command; return (rc, stdout, stderr). Never raises."""
+                  try:
+                      proc = subprocess.run(
+                          cmd,
+                          capture_output=True,
+                          text=True,
+                          timeout=timeout,
+                          errors="replace",
+                      )
+                      return proc.returncode, proc.stdout, proc.stderr
+                  except FileNotFoundError:
+                      return 127, "", "command not found"
+                  except subprocess.TimeoutExpired:
+                      return 124, "", "timed out"
+                  except Exception as exc:  # noqa: BLE001
+                      return 1, "", str(exc)
+
+
+              # ═══════════════════════════════════════════════════════════════
+              # Debian / Ubuntu / Kali
+              # ═══════════════════════════════════════════════════════════════
+
+              DEB_KERNEL_RE = re.compile(
+                  r"^(linux-image|linux-headers|linux-modules|linux-generic|linux-virtual)",
+                  re.I,
+              )
+              DEB_SECURITY_NAME_RE = re.compile(
+                  r"^(openssl|openssh-server|openssh-client|libssl|libgnutls|libnss|gnupg|gnupg2)",
+                  re.I,
+              )
+              DEB_RUNTIME_RE = re.compile(
+                  r"^(python3?[0-9.\-]*|perl|ruby|php[0-9.\-]*|nodejs|npm|openjdk|java)",
+                  re.I,
+              )
+              # Matches a Debian changelog version-header line, e.g.:
+              #   "linux (6.8.0-51.52) noble; urgency=medium"
+              DEB_CHANGELOG_HEADER_RE = re.compile(r"^(\S+)\s+\(([^()]*)\)[^\n]*urgency", re.I)
+              KALI_SECURITY_NOTE = (
+                  "Kali has no stable '-security' pocket for apt-cache madison to key "
+                  "off of, so Security/Kernel classification here relies only on "
+                  "kernel-name, package-name, and Section heuristics -- weaker than "
+                  "Debian/Ubuntu. To compensate, CVE lookups are attempted for ALL "
+                  "pending packages on this host (not just ones classified Security/"
+                  "Kernel), bounded by patch_detail_limit/patch_cve_workers/"
+                  "patch_cve_timeout like everywhere else."
+              )
+
+
+              def get_apt_policy(pkgs):
+                  """
+                  Returns {pkg: {'installed': ver, 'candidate': ver}}.
+
+                  apt-cache policy is the authoritative source for what apt will
+                  actually install — it honours APT pinning, backports, and all
+                  /etc/apt/preferences files. apt-cache show does NOT.
+                  """
+                  rc, out, _ = run(["apt-cache", "policy", *pkgs], timeout=120)
+                  result = {}
+                  cur_pkg = None
+                  for line in out.splitlines():
+                      m = re.match(r"^(\S+):$", line)
+                      if m:
+                          cur_pkg = m.group(1)
+                          result[cur_pkg] = {"installed": "unknown", "candidate": "unknown"}
+                          continue
+                      if cur_pkg:
+                          mi = re.match(r"\s+Installed:\s+(\S+)", line)
+                          mc = re.match(r"\s+Candidate:\s+(\S+)", line)
+                          if mi:
+                              v = mi.group(1)
+                              result[cur_pkg]["installed"] = "" if v == "(none)" else v
+                          if mc:
+                              v = mc.group(1)
+                              result[cur_pkg]["candidate"] = "" if v == "(none)" else v
+                  return result
+
+
+              def parse_apt_show(text):
+                  """
+                  Parse 'apt-cache show pkg1 pkg2 ...' output into
+                  {pkg: {field: value}}.
+
+                  Used ONLY for Description, Origin, Section, and Installed-Size
+                  (size estimate). NOT used for version resolution (see
+                  get_apt_policy above).
+                  """
+                  result = {}
+                  stanza = {}
+                  cur_field = None
+                  pkg_name = None
+                  for line in text.splitlines():
+                      if line == "":
+                          if pkg_name and pkg_name not in result:
+                              result[pkg_name] = stanza
+                          stanza, cur_field, pkg_name = {}, None, None
+                          continue
+                      if line[:1] in (" ", "\t"):
+                          if cur_field:
+                              stanza[cur_field] = (
+                                  stanza.get(cur_field, "") + " " + line.strip()
+                              ).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          stanza[key] = val
+                          cur_field = key
+                          if key == "Package":
+                              pkg_name = val
+                  if pkg_name and pkg_name not in result:
+                      result[pkg_name] = stanza
+                  return result
+
+
+              def categorize_debian(pkg, section, is_security_pocket):
+                  """Returns (category, security_source) tuple.
+
+                  FIX C: is_security_pocket is checked FIRST, ahead of the
+                  kernel-name match. Kernel CVEs are one of the most common
+                  things Ubuntu/Debian ship through the -security pocket, not
+                  an edge case -- so a kernel package that is ALSO a security
+                  update must be classified "Security" (and therefore made
+                  CVE-eligible), not "Kernel".
+                  """
+                  if is_security_pocket:
+                      return "Security", "apt-security-pocket"
+                  if DEB_KERNEL_RE.match(pkg):
+                      return "Kernel", "none"
+                  if DEB_SECURITY_NAME_RE.match(pkg):
+                      return "Security", "package-name-heuristic"
+                  if "security" in section.lower():
+                      return "Security", "section-heuristic"
+                  if section.lower().startswith("libs"):
+                      return "Library", "none"
+                  if DEB_RUNTIME_RE.match(pkg):
+                      return "Runtime", "none"
+                  if re.search(r"admin|utils", section, re.I):
+                      return "System", "none"
+                  return "Application", "none"
+
+
+              def debian_cves(pkg, current_version, timeout):
+                  """
+                  Returns comma-separated CVE IDs fixed by upgrading `pkg` from
+                  current_version to its candidate version, or "" if none were
+                  found or the lookup was unavailable (e.g. no network).
+
+                  Debian/Ubuntu has no dnf-style structured advisory metadata to
+                  draw on, so this parses `apt-get changelog <pkg>` (requires
+                  network access to changelogs.ubuntu.com / metadata.debian.net
+                  -- disable via patch_fetch_cves: false on air-gapped hosts).
+
+                  FIX D: changelog entries are newest-first. Parsing now stops
+                  as soon as it reaches the block for the version currently
+                  INSTALLED on this host, so only CVEs mentioned in versions
+                  between current_version (exclusive) and the candidate
+                  (inclusive) are reported. Without this bound, a package with
+                  a long changelog history would also surface CVEs that were
+                  already fixed by versions the host has already applied --
+                  reporting fixes as "pending" that the host doesn't need.
+                  """
+                  rc, out, _ = run(["apt-get", "changelog", pkg], timeout=timeout)
+                  if rc != 0 or not out.strip():
+                      return ""
+
+                  cves = []
+                  current_known = current_version and current_version not in ("unknown", "")
+                  block_lines = []
+                  block_version = None
+
+                  def flush_block():
+                      if block_version is not None:
+                          cves.extend(re.findall(r"CVE-\d{4}-\d+", "\n".join(block_lines)))
+
+                  for line in out.splitlines():
+                      m = DEB_CHANGELOG_HEADER_RE.match(line)
+                      if m:
+                          # New version block starting -- flush the previous one
+                          # (unless the previous one WAS the installed version,
+                          # in which case we already stopped below).
+                          flush_block()
+                          this_version = m.group(2).strip()
+                          if current_known and this_version == current_version:
+                              # Reached the currently-installed version's own
+                              # changelog entry -- everything at or below this
+                              # point is already applied. Stop here.
+                              block_version = None
+                              break
+                          block_version = this_version
+                          block_lines = [line]
+                          continue
+                      if block_version is not None:
+                          block_lines.append(line)
+
+                  flush_block()
+                  return ",".join(sorted(set(cves)))
+
+
+              def scan_debian(distro=""):
+                  """
+                  distro: ansible_distribution value, e.g. "Ubuntu", "Debian", "Kali".
+
+                  Returns (patches, warnings).
+                  """
+                  warnings = []
+                  is_kali = distro.lower() == "kali"
+                  if is_kali:
+                      warnings.append(KALI_SECURITY_NOTE)
+
+                  # FIX A — no Always-Include-Phased-Updates override anymore.
+                  # This means the list reflects ONLY what `apt upgrade` would
+                  # actually install on THIS host right now — if Ubuntu is still
+                  # phasing an update out to this machine, it correctly will NOT
+                  # show up yet.
+                  # NOTE: apt-get -s = simulate. This never installs anything.
+                  rc, out, _ = run(
+                      [
+                          "apt-get", "-s", "dist-upgrade",
+                          "-o", "Debug::NoLocking=true",
+                      ],
+                      timeout=300,
+                  )
+                  pkgs = sorted(
+                      {
+                          line.split()[1]
+                          for line in out.splitlines()
+                          if line.startswith("Inst ") and len(line.split()) > 1
+                      }
+                  )
+                  if not pkgs:
+                      return [], warnings
+
+                  policy = get_apt_policy(pkgs)
+
+                  _, show_out, _ = run(
+                      ["apt-cache", "show", "--no-all-versions", *pkgs],
+                      timeout=120,
+                  )
+                  candidates = parse_apt_show(show_out)
+
+                  madison = {}
+                  if not is_kali:
+                      _, madison_out, _ = run(["apt-cache", "madison", *pkgs], timeout=60)
+                      for line in madison_out.splitlines():
+                          cols = [c.strip() for c in line.split("|")]
+                          if len(cols) >= 3:
+                              madison.setdefault(cols[0], []).append((cols[1], cols[2]))
+
+                  # Pass 1: classify every package. Cheap and local -- no
+                  # network calls here, so it always runs for every pending
+                  # package regardless of DETAIL_LIMIT.
+                  classified = {}
+                  for pkg in pkgs:
+                      pol = policy.get(pkg, {})
+                      new_ver = pol.get("candidate", "unknown") or "unknown"
+                      cand = candidates.get(pkg, {})
+                      section = cand.get("Section", "")
+
+                      is_security_pocket = (not is_kali) and any(
+                          "-security" in src
+                          and (new_ver in ("unknown", "") or ver == new_ver)
+                          for ver, src in madison.get(pkg, [])
+                      )
+                      classified[pkg] = categorize_debian(pkg, section, is_security_pocket)
+
+                  # Pass 2 — FIX E: fetch CVEs concurrently, only for packages
+                  # actually eligible (Security: real fixes; Kernel: a second
+                  # line of defense since kernel CVEs occasionally ship outside
+                  # the -security pocket), bounded by DETAIL_LIMIT. Each lookup
+                  # is a slow network round-trip via apt-get changelog, so this
+                  # runs in a small thread pool rather than serially -- run
+                  # serially, even a modest pending set can turn a 900-second
+                  # scan window into tens of minutes and silently starve out
+                  # CVE data for whichever packages happen to be last in line.
+                  # FIX H — on Kali, Security/Kernel classification is
+                  # heuristic-only (no -security pocket signal available),
+                  # so restricting CVE lookups to those categories would
+                  # leave almost everything unchecked. All pending packages
+                  # are eligible on Kali instead, still bounded the same way.
+                  if is_kali:
+                      cve_eligible = pkgs[:DETAIL_LIMIT]
+                  else:
+                      cve_eligible = [
+                          pkg for pkg in pkgs if classified[pkg][0] in ("Security", "Kernel")
+                      ][:DETAIL_LIMIT]
+
+                  cves_by_pkg = {}
+                  if FETCH_CVES and cve_eligible:
+                      with cf.ThreadPoolExecutor(max_workers=CVE_WORKERS) as pool:
+                          futures = {
+                              pool.submit(
+                                  debian_cves,
+                                  pkg,
+                                  policy.get(pkg, {}).get("installed", ""),
+                                  CVE_TIMEOUT,
+                              ): pkg
+                              for pkg in cve_eligible
+                          }
+                          for fut in cf.as_completed(futures):
+                              pkg = futures[fut]
+                              try:
+                                  cves_by_pkg[pkg] = fut.result()
+                              except Exception:  # noqa: BLE001 — a single slow/broken
+                                  cves_by_pkg[pkg] = ""  # lookup must never sink the scan
+
+                  # Pass 3: assemble the final report.
+                  results = []
+                  for pkg in pkgs:
+                      pol = policy.get(pkg, {})
+                      cand = candidates.get(pkg, {})
+
+                      cur_ver = pol.get("installed", "unknown") or "unknown"
+                      new_ver = pol.get("candidate", "unknown") or "unknown"
+
+                      raw_size = cand.get("Installed-Size", "0") or "0"
+                      size_kb = re.sub(r"[^\d]", "", str(raw_size)) or "0"
+
+                      desc = cand.get("Description-en") or cand.get("Description") or ""
+                      origin = cand.get("Origin", "Unknown")
+
+                      category, security_source = classified[pkg]
+                      cves = cves_by_pkg.get(pkg, "")
+
+                      results.append(
+                          {
+                              "name":            pkg,
+                              "current_version": cur_ver,
+                              "new_version":     new_ver,
+                              "size_kb":         size_kb,
+                              "description":     desc[:120],
+                              "origin":          origin,
+                              "category":        category,
+                              # display_category: coarse bucket used by the
+                              # playbook for AWX color-coding. Debian/apt has
+                              # no native bugfix-vs-enhancement metadata like
+                              # dnf's advisory types, so anything non-security
+                              # is bucketed as SYSTEM rather than guessed.
+                              # (cves is still populated for Kernel-category
+                              # packages even though they display as SYSTEM.)
+                              "display_category": "SECURITY" if category == "Security" else "SYSTEM",
+                              "security_source": security_source,
+                              # Debian/apt has no Critical/Important/Moderate/
+                              # Low severity taxonomy like RHEL advisories --
+                              # report that plainly rather than guessing one.
+                              "severity":        "N/A",
+                              "cves":            cves,
+                          }
+                      )
+                  return results, warnings
+
+
+              # ═══════════════════════════════════════════════════════════════
+              # RHEL / CentOS / AlmaLinux / Rocky / Amazon / Oracle
+              # ═══════════════════════════════════════════════════════════════
+
+              RH_KERNEL_RE  = re.compile(r"^kernel",                      re.I)
+              RH_RUNTIME_RE = re.compile(
+                  r"^(python[0-9]*|perl|ruby|php|nodejs|npm|java|jdk)",   re.I
+              )
+
+              RH_SKIP_UPDATEINFO_DISTROS = {"amazon", "amazonlinux", "oraclelinux", "oracle"}
+
+              SEVERITY_RANK = {"critical": 4, "important": 3, "moderate": 2, "low": 1}
+
+              # Matches the boxed title line dnf/yum prints above each advisory
+              # in `updateinfo info` output, e.g.:
+              #   "  Critical: samba security update"
+              #   "  Low: libtasn1 security update"
+              ADVISORY_TITLE_RE = re.compile(
+                  r"^\s*(Critical|Important|Moderate|Low|None)\s*:\s*(.+)$", re.I
+              )
+              ADVISORY_RULE_RE = re.compile(r"^=+$")
+
+
+              def strip_nevra(nevra):
+                  """Extract the plain package name from a NEVRA-ish string.
+
+                  FIX J: dnf/yum's 'Packages:'-style listings use the full
+                  compound NEVRA form name-epoch:version-release.arch (e.g.
+                  "dracut-0:057-117.git20260625.el9_8.x86_64"). A naive split
+                  on the first colon anywhere in the string lands mid-name
+                  (turning "dracut" into "dracut-0"). RPM's spec forbids
+                  hyphens inside Version/Release fields, so after stripping
+                  the arch suffix, the package name is simply everything
+                  except the LAST TWO hyphen-separated segments (version,
+                  release) -- this holds regardless of whether an epoch is
+                  present, and regardless of whether it's attached as
+                  'epoch:version' (compound NEVRA) or omitted/in a separate
+                  column. A bare 'name.arch' with nothing else attached
+                  (nothing left to strip) is returned unchanged.
+                  """
+                  name = ARCH_SUFFIX_RE.sub("", nevra)
+                  parts = name.split("-")
+                  if len(parts) >= 3:
+                      name = "-".join(parts[:-2])
+                  return name
+
+
+              def parse_check_update(text):
+                  """
+                  Parse `dnf/yum check-update` output into plain package names.
+                  Handles repo loading lines, "Obsoleting Packages" blocks,
+                  modular stream suffixes, Security: section markers, and
+                  epoch-prefixed NEVRAs.
+                  """
+                  SKIP_PREFIXES = (
+                      "Last metadata",
+                      "Loaded plugins",
+                      "Loading mirror",
+                      "Security:",
+                      "Added Packages",
+                  )
+                  SECTION_HEADER_RE = re.compile(r"^[A-Z][A-Za-z ]+Packages\s*:?$")
+
+                  in_obsoleting = False
+                  pkgs = []
+
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line:
+                          continue
+
+                      if re.match(r"^Obsoleting", line, re.I):
+                          in_obsoleting = True
+                          continue
+
+                      if SECTION_HEADER_RE.match(line):
+                          in_obsoleting = False
+                          continue
+
+                      if in_obsoleting:
+                          continue
+
+                      if any(line.startswith(p) for p in SKIP_PREFIXES):
+                          continue
+
+                      if re.match(r"^[=\-\*]+$", line):
+                          continue
+
+                      parts = line.split()
+                      if len(parts) < 2:
+                          continue
+
+                      nevra = parts[0]
+                      name  = strip_nevra(nevra)
+
+                      if not name or re.match(r"^\d", name):
+                          continue
+
+                      pkgs.append(name)
+
+                  return sorted(set(pkgs))
+
+
+              # FIX B — section-aware: only_section restricts which header block
+              # ("installed packages" vs "available packages") stanzas are read
+              # from, so an "available" query can never pick up an Installed
+              # stanza (or vice versa) for a package that has both.
+              def parse_pkg_info(text, only_section=None):
+                  """
+                  Parse '<dnf|yum> info [installed|available] ...' output into
+                  {name: {field: value}}.
+
+                  only_section: None | 'installed' | 'available'. When set,
+                  only stanzas that appeared under the matching section
+                  header are kept.
+                  """
+                  result = {}
+                  block  = {}
+                  cur_key = None
+                  cur_section = None
+
+                  def header_kind(line):
+                      h = line.strip().lower().rstrip(":").strip()
+                      if h == "installed packages":
+                          return "installed"
+                      if h == "available packages":
+                          return "available"
+                      return None
+
+                  for line in text.splitlines():
+                      kind = header_kind(line)
+                      if kind:
+                          cur_section = kind
+                          continue
+                      if not line.strip():
+                          if "Name" in block and (
+                              only_section is None or cur_section == only_section
+                          ):
+                              result.setdefault(block["Name"], block)
+                          block, cur_key = {}, None
+                          continue
+                      if line[:1] in (" ", "\t") and cur_key:
+                          block[cur_key] = (
+                              block.get(cur_key, "") + " " + line.strip()
+                          ).strip()
+                          continue
+                      if ":" in line:
+                          key, _, val = line.partition(":")
+                          key, val = key.strip(), val.strip()
+                          block[key] = val
+                          cur_key = key
+                  if "Name" in block and (
+                      only_section is None or cur_section == only_section
+                  ):
+                      result.setdefault(block["Name"], block)
+                  return result
+
+
+              def run_advisory_cmd(mgr, updateinfo_args, advisory_args, timeout=180):
+                  """
+                  FIX F — dnf5 restructured 'updateinfo' into a separate
+                  'advisory' command family and does not always ship the
+                  'updateinfo' compatibility alias (dnf5-plugins). Tries the
+                  classic '<mgr> updateinfo <updateinfo_args>' first (works
+                  on dnf, yum, and any dnf5 build that DOES ship the compat
+                  shim); if that fails and mgr is dnf5, retries with
+                  '<mgr> advisory <advisory_args>' (dnf5's native syntax).
+
+                  Returns (rc, stdout, stderr, note) where note records
+                  which command path actually ran/failed, for diagnostics.
+                  """
+                  rc, out, err = run([mgr, "-q", "updateinfo", *updateinfo_args], timeout=timeout)
+                  if rc == 0:
+                      return rc, out, err, "updateinfo"
+                  if os.path.basename(mgr) == "dnf5":
+                      rc2, out2, err2 = run([mgr, "-q", "advisory", *advisory_args], timeout=timeout)
+                      if rc2 == 0:
+                          return rc2, out2, err2, "advisory (dnf5 fallback)"
+                      return rc2, out2, err2, "advisory (dnf5 fallback, also failed)"
+                  return rc, out, err, "updateinfo (failed; not dnf5, no fallback available)"
+
+
+              def parse_updateinfo_list(text):
+                  """
+                  Parse `<dnf|yum> updateinfo list --available` (or dnf5's
+                  `advisory list --available`) -- ALL advisories, not just
+                  security -- into:
+                      {pkg_name: {"advisory_ids": {...}, "types": {...},
+                                  "severities": {...}}}
+
+                  FIX K: this is also how CVE-to-package linkage is
+                  established. Every line in this format ALWAYS pairs an
+                  advisory_id directly with the affected package's NEVRA in
+                  the same row -- a column some dnf5/AlmaLinux builds'
+                  `updateinfo info` output omits entirely for the equivalent
+                  data. Joining package -> advisory_id -> CVEs (via
+                  parse_updateinfo_info_blocks) on advisory_id therefore
+                  never depends on that missing section.
+
+                  FIX L: severity (Critical/Important/Moderate/Low) is read
+                  from the same "Critical/Sec."-style type token dnf/yum
+                  prints in this listing, with no extra command needed.
+
+                  Typical line shape (dnf4/dnf5/yum-plugin-security all vary
+                  a little, but always end with the NEVRA and carry a
+                  type/severity token in the middle), e.g.:
+                      ALSA-2026:25049   Critical/Sec.   samba-4.20.1-6.el9_8.x86_64
+                      RHSA-2024:1234    Bugfix          pkg-1.2-3.el9.x86_64
+                  """
+                  SKIP_PREFIXES = ("Last metadata", "Loaded plugins", "Updates Information", "Update ")
+                  result = {}
+                  for raw in text.splitlines():
+                      line = raw.strip()
+                      if not line or line.startswith(SKIP_PREFIXES):
+                          continue
+                      parts = line.split()
+                      if len(parts) < 3:
+                          continue
+
+                      advisory_id, type_token, nevra = parts[0], parts[1], parts[-1]
+                      name = strip_nevra(nevra)
+                      if not name:
+                          continue
+
+                      severity, kind = None, None
+                      if "/" in type_token:
+                          sev_part, _, rest = type_token.partition("/")
+                          if sev_part.lower() in SEVERITY_RANK:
+                              severity = sev_part.title()
+                          if rest.lower().startswith("sec"):
+                              kind = "security"
+                      else:
+                          low = type_token.lower()
+                          if low.startswith("sec"):
+                              kind = "security"
+                          elif "bugfix" in low:
+                              kind = "bugfix"
+                          elif "enhancement" in low or "newpackage" in low:
+                              kind = "enhancement"
+
+                      entry = result.setdefault(
+                          name, {"advisory_ids": set(), "types": set(), "severities": set()}
+                      )
+                      entry["advisory_ids"].add(advisory_id)
+                      if kind:
+                          entry["types"].add(kind)
+                      if severity:
+                          entry["severities"].add(severity)
+                  return result
+
+
+              def parse_updateinfo_info_blocks(text):
+                  """
+                  Parse `<dnf|yum> updateinfo info security --available` (or
+                  dnf5's `advisory info --security --available`) into:
+                      {advisory_id: {"cves": [...], "severity": str|None,
+                                     "type": str|None}}
+
+                  FIX K: deliberately does NOT try to read package names back
+                  out of this output -- some dnf5/AlmaLinux builds never print
+                  a "Packages:"/"Affected Packages:" section here at all, so
+                  relying on one silently drops every CVE. Package linkage is
+                  done separately in scan_redhat() by joining on advisory_id
+                  against parse_updateinfo_list(), which always has the NEVRA.
+
+                  FIX L: also captures the "Severity:" field and/or the boxed
+                  title line above each advisory (e.g.
+                  "Critical: samba security update") as a fallback, so
+                  severity is available even if one of the two is missing.
+
+                  Correctly follows the RHEL/AlmaLinux errata multi-line
+                  field continuation convention, where a field's value can
+                  wrap onto following lines that are indented and begin with
+                  a bare ':' :
+                      CVEs: CVE-2026-1933
+                          : CVE-2026-2340
+                          : CVE-2026-3012
+                  The previous version of this parser did not follow that
+                  continuation, so any advisory listing more than one CVE
+                  silently lost all but the first.
+                  """
+                  blocks = {}
+                  cur_id = None
+                  cur_field = None
+                  fields = {}
+                  pending_title_severity = None
+                  after_rule = False
+
+                  def flush():
+                      if cur_id:
+                          cve_text = fields.get("cves", "")
+                          cves = sorted(set(re.findall(r"CVE-\d{4}-\d+", cve_text)))
+                          severity = fields.get("severity") or fields.get("_title_severity")
+                          blocks[cur_id] = {
+                              "cves": cves,
+                              "severity": severity.title() if severity else None,
+                              "type": (fields.get("type") or "").strip().lower() or None,
+                          }
+
+                  for raw in text.splitlines():
+                      line = raw.rstrip("\n")
+                      stripped = line.strip()
+
+                      if ADVISORY_RULE_RE.match(stripped):
+                          after_rule = True
+                          continue
+
+                      if not stripped:
+                          after_rule = False
+                          continue
+
+                      if after_rule:
+                          title_m = ADVISORY_TITLE_RE.match(line)
+                          after_rule = False
+                          if title_m:
+                              pending_title_severity = title_m.group(1).title()
+                              continue
+
+                      field_m = re.match(r"^\s*([A-Za-z][A-Za-z0-9 ()/_-]*)\s*:\s*(.*)$", line)
+                      if field_m:
+                          label = field_m.group(1).strip().lower()
+                          value = field_m.group(2).strip()
+                          if label == "update id":
+                              flush()
+                              cur_id = value
+                              fields = (
+                                  {"_title_severity": pending_title_severity}
+                                  if pending_title_severity
+                                  else {}
+                              )
+                              pending_title_severity = None
+                              cur_field = None
+                              continue
+                          cur_field = label
+                          fields[cur_field] = (fields.get(cur_field, "") + " " + value).strip()
+                          continue
+
+                      cont_m = re.match(r"^\s*:\s*(.*)$", line)
+                      if cont_m and cur_field:
+                          fields[cur_field] = (
+                              fields.get(cur_field, "") + " " + cont_m.group(1)
+                          ).strip()
+                          continue
+
+                  flush()
+                  return blocks
+
+
+              def best_severity(severities):
+                  """Highest-ranked severity in a set, or None if empty/unknown."""
+                  ranked = [s for s in severities if s and s.lower() in SEVERITY_RANK]
+                  if not ranked:
+                      return None
+                  return max(ranked, key=lambda s: SEVERITY_RANK[s.lower()])
+
+
+              def categorize_redhat(pkg, in_security_list):
+                  """Returns (category, security_source) tuple."""
+                  if in_security_list:
+                      return "Security", "updateinfo-list"
+                  if RH_KERNEL_RE.match(pkg):
+                      return "Kernel", "none"
+                  if RH_RUNTIME_RE.match(pkg):
+                      return "Runtime", "none"
+                  if pkg.lower().startswith("lib"):
+                      return "Library", "none"
+                  return "Application", "none"
+
+
+              def scan_redhat(distro=""):
+                  """
+                  distro: ansible_distribution value, e.g. "RedHat", "CentOS",
+                  "AlmaLinux", "Rocky", "Amazon", "OracleLinux".
+
+                  Returns (patches, warnings).
+                  """
+                  warnings = []
+                  mgr = shutil.which("dnf5") or shutil.which("dnf") or shutil.which("yum")
+                  if not mgr:
+                      return [], ["No supported package manager (dnf5/dnf/yum) found on this host."]
+
+                  skip_updateinfo = distro.lower().replace(" ", "") in RH_SKIP_UPDATEINFO_DISTROS
+                  if skip_updateinfo:
+                      warnings.append(
+                          f"CVE/advisory data intentionally skipped for distro='{distro}' -- "
+                          "its updateinfo format isn't reliable enough to trust here. Packages "
+                          "are still listed, but 'cves'/'severity' will be empty and security "
+                          "classification falls back to name/kernel heuristics only."
+                      )
+
+                  rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
+                  if rc not in (0, 100):
+                      return [], warnings
+
+                  pkgs = parse_check_update(out)
+                  if not pkgs:
+                      return [], warnings
+
+                  # FIX B — 'info <pkgs>' can print BOTH Installed and Available
+                  # stanzas for a package with a pending update; only_section
+                  # keeps them from being mixed up.
+                  _, avail_out, _ = run([mgr, "-q", "info", *pkgs], timeout=180)
+                  avail = parse_pkg_info(avail_out, only_section="available")
+
+                  _, inst_out, _ = run([mgr, "-q", "info", "installed", *pkgs], timeout=180)
+                  installed = parse_pkg_info(inst_out, only_section="installed")
+
+                  pkg_meta = {}
+                  advisory_map = {}
+
+                  if not skip_updateinfo:
+                      # FIX K/L — two calls, joined on advisory_id:
+                      #   1) 'updateinfo list --available'  -> pkg -> {advisory_ids, types, severities}
+                      #   2) 'updateinfo info security --available' -> advisory_id -> {cves, severity, type}
+                      # See the FIX K/L docstrings above for why this replaces
+                      # the old "Packages:"-section-inside-info-output approach.
+                      rc_list, list_out, err_list, used_list = run_advisory_cmd(
+                          mgr,
+                          ["list", "--available"],
+                          ["list", "--available"],
+                      )
+                      if rc_list != 0:
+                          warnings.append(
+                              f"'{mgr} {used_list}' failed (rc={rc_list}) while listing advisories -- "
+                              "package type/severity/CVE linkage could not be established. Common "
+                              "causes: the updateinfo/advisory subcommand isn't available (dnf: "
+                              "install dnf-plugins-core; yum: install yum-utils) or the configured "
+                              f"repos don't publish updateinfo/errata metadata. Detail: {(err_list or '').strip()[:200]}"
+                          )
+                      else:
+                          pkg_meta = parse_updateinfo_list(list_out)
+                          if pkgs and not pkg_meta:
+                              warnings.append(
+                                  "Advisory listing ran successfully but returned no advisory data "
+                                  "at all for any pending package on this host. If CVEs are known "
+                                  "to exist (e.g. seen when running the equivalent command by hand), "
+                                  "this usually means the repo's updateinfo/errata metadata is empty "
+                                  "or not synced for this mirror (common on CentOS Stream and some "
+                                  "third-party/offline mirrors) rather than a scan failure."
+                              )
+
+                      rc_info, secinfo_out, err_info, used_info = run_advisory_cmd(
+                          mgr,
+                          ["info", "security", "--available"],
+                          ["info", "--security", "--available"],
+                      )
+                      if rc_info == 0:
+                          advisory_map = parse_updateinfo_info_blocks(secinfo_out)
+                      elif rc_list == 0:
+                          warnings.append(
+                              f"'{mgr} {used_info}' failed (rc={rc_info}) while fetching advisory "
+                              "detail -- security packages are correctly identified from the "
+                              "advisory list, but their CVE IDs/severity could not be retrieved. "
+                              f"Detail: {(err_info or '').strip()[:200]}"
+                          )
+
+                  def _fmt_version(info):
+                      """
+                      Build a full NEVR-style version string, including Epoch
+                      when present and non-zero.
+                      """
+                      ver, rel = info.get("Version", ""), info.get("Release", "")
+                      epoch = info.get("Epoch", "0")
+                      base = f"{ver}-{rel}" if rel else (ver or "unknown")
+                      if base == "unknown":
+                          return base
+                      return f"{epoch}:{base}" if epoch not in ("", "0") else base
+
+                  results = []
+                  for pkg in pkgs:
+                      a = avail.get(pkg, {})
+                      i = installed.get(pkg, {})
+
+                      new_ver = _fmt_version(a)
+                      cur_ver = _fmt_version(i)
+
+                      raw_size = a.get("Size") or i.get("Size") or "0"
+                      size_kb  = re.sub(r"[^\d]", "", str(raw_size)) or "0"
+
+                      desc = a.get("Summary") or i.get("Summary") or ""
+
+                      meta = pkg_meta.get(
+                          pkg, {"advisory_ids": set(), "types": set(), "severities": set()}
+                      )
+                      is_security = "security" in meta["types"]
+
+                      category, security_source = categorize_redhat(pkg, is_security)
+
+                      cve_set = set()
+                      for aid in meta["advisory_ids"]:
+                          info_block = advisory_map.get(aid)
+                          if info_block:
+                              cve_set.update(info_block["cves"])
+                      cves = ",".join(sorted(cve_set))
+
+                      severity = best_severity(meta["severities"]) or "None"
+
+                      # display_category: coarse bucket used by the playbook
+                      # for AWX color-coding. Uses REAL dnf/yum advisory type
+                      # data; anything with no matching advisory (a plain
+                      # package bump with no bugzilla/CVE tied to it) falls
+                      # back to SYSTEM.
+                      if "security" in meta["types"]:
+                          display_category = "SECURITY"
+                      elif "bugfix" in meta["types"]:
+                          display_category = "BUGFIX"
+                      elif "enhancement" in meta["types"]:
+                          display_category = "ENHANCEMENT"
+                      else:
+                          display_category = "SYSTEM"
+
+                      results.append(
+                          {
+                              "name":            pkg,
+                              "current_version": cur_ver,
+                              "new_version":     new_ver,
+                              "size_kb":         size_kb,
+                              "description":     desc[:120],
+                              "origin":          "RedHat",
+                              "category":        category,
+                              "display_category": display_category,
+                              "security_source": security_source,
+                              "severity":        severity,
+                              "cves":            cves,
+                          }
+                      )
+                  return results, warnings
+
+
+              # ═══════════════════════════════════════════════════════════════
+              # Entry point
+              # ═══════════════════════════════════════════════════════════════
+
+              def main():
+                  os_family = sys.argv[1] if len(sys.argv) > 1 else ""
+                  distro    = sys.argv[2] if len(sys.argv) > 2 else ""
+
+                  patches, warnings = [], []
+                  try:
+                      if os_family == "Debian":
+                          patches, warnings = scan_debian(distro=distro)
+                      elif os_family == "RedHat":
+                          patches, warnings = scan_redhat(distro=distro)
+                      else:
+                          warnings = [f"Unsupported ansible_os_family '{os_family}'."]
+                  except Exception as exc:  # noqa: BLE001 — never crash; always emit valid JSON
+                      patches, warnings = [], [f"scanner crashed unexpectedly: {exc}"]
+
+                  # FIX I — {"patches": [...], "warnings": [...]} instead of a
+                  # bare patch array, so "couldn't verify CVE data" has a
+                  # channel distinct from "verified, found nothing".
+                  print(json.dumps({"patches": patches, "warnings": warnings}))
+
+
+              if __name__ == "__main__":
+                  main()
+              {% endraw %}
+
+        - name: Run patch scanner
+          ansible.builtin.command: >
+            {{ patch_scanner_python }}
+            {{ remote_scanner }}
+            {{ ansible_os_family }}
+            {{ ansible_distribution }}
+          register: scan_result
+          changed_when: false
+          failed_when: false
+          timeout: "{{ patch_scan_timeout }}"
+          environment:
+            LC_ALL: C
+            LANG: C
+            PATCH_DETAIL_LIMIT: "{{ patch_detail_limit }}"
+            PATCH_FETCH_CVES:   "{{ '1' if patch_fetch_cves else '0' }}"
+            PATCH_CVE_TIMEOUT:  "{{ patch_cve_timeout }}"
+            PATCH_CVE_WORKERS:  "{{ patch_cve_workers }}"
+
+        - name: Parse patch scanner output
+          block:
+            - ansible.builtin.set_fact:
+                all_patches:   "{{ (scan_result.stdout | from_json).patches | default([]) }}"
+                scan_warnings: "{{ (scan_result.stdout | from_json).warnings | default([]) }}"
+          rescue:
+            - ansible.builtin.set_fact:
+                all_patches: []
+                scan_warnings: []
+                scan_error: >-
+                  Patch scanner failed (rc={{ scan_result.rc }}):
+                  {{ (scan_result.stderr | default('') + ' ' + scan_result.stdout | default(''))
+                     | trim | truncate(300) }}
+
+      always:
+        - name: Remove patch scanner script
+          ansible.builtin.file:
+            path:  "{{ remote_scanner }}"
+            state: absent
+          ignore_errors: yes
+          tags: [cleanup]
+
+    - name: Note unsupported OS family
+      ansible.builtin.set_fact:
+        scan_error: "Unsupported ansible_os_family '{{ ansible_os_family }}' — no patch scan performed"
+      when:
+        - ansible_os_family not in ['Debian', 'RedHat']
+        - not repo_validation_failed
+      tags: [validation]
+
+    - name: Stop scan timer
+      ansible.builtin.set_fact:
+        scan_end_epoch: "{{ now(fmt='%s') | int }}"
+        scan_duration_seconds: "{{ (now(fmt='%s') | int) - (scan_start_epoch | int) }}"
+      tags: [always]
+
+    # ───────────────────────────────────────────────────────────────────────
+    # DISPLAY — shows the patch list directly in the AWX Job Output tab.
+    # Read-only; changes nothing.
+    #
+    # NOTE ON COLOR: ANSI escape codes do NOT work here. Ansible's callback
+    # JSON-serializes every module result (including debug's msg) before
+    # printing it, and JSON requires control characters — including the
+    # ESC byte (0x1B) that starts every ANSI code, and even a plain "\n" —
+    # to be escaped. So embedded color codes always show up as literal
+    # text like "\u001b[31m" instead of an actual color, in AWX or plain
+    # ansible-playbook alike. The fix for readability instead is to pass
+    # `msg` as a LIST of single-line strings rather than one multi-line
+    # string: each list item is a clean, control-character-free string, so
+    # Ansible/AWX renders one line per list item with no escaping artifacts.
+    #
+    #   [SECURITY]    real CVE/security advisories
+    #   [BUGFIX]      RHEL: real dnf/yum bugfix advisories only
+    #   [ENHANCEMENT] RHEL: real dnf/yum enhancement advisories only
+    #   [SYSTEM]      everything else — incl. all non-security Debian/
+    #                 Ubuntu updates, since apt has no equivalent bugfix/
+    #                 enhancement metadata to draw on
+    #
+    #   severity is Critical/Important/Moderate/Low (RHEL, from real
+    #   advisory data), "None" (RHEL, no security advisory attached), or
+    #   "N/A" (Debian family — no equivalent taxonomy exists there).
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Compute patch counts by category
+      ansible.builtin.set_fact:
+        security_count:    "{{ all_patches | selectattr('display_category', 'equalto', 'SECURITY')    | list | length }}"
+        bugfix_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'BUGFIX')      | list | length }}"
+        enhancement_count: "{{ all_patches | selectattr('display_category', 'equalto', 'ENHANCEMENT') | list | length }}"
+        system_count:      "{{ all_patches | selectattr('display_category', 'equalto', 'SYSTEM')      | list | length }}"
+      when: (all_patches | length) > 0
+      tags: [report]
+
+    # FIX L — real per-host counts by CVE severity, straight from dnf/yum
+    # advisory data (Debian patches all report severity "N/A" and simply
+    # won't match any of these four buckets).
+    - name: Compute patch counts by severity
+      ansible.builtin.set_fact:
+        critical_count:  "{{ all_patches | selectattr('severity', 'equalto', 'Critical')  | list | length }}"
+        important_count: "{{ all_patches | selectattr('severity', 'equalto', 'Important') | list | length }}"
+        moderate_count:  "{{ all_patches | selectattr('severity', 'equalto', 'Moderate')  | list | length }}"
+        low_count:       "{{ all_patches | selectattr('severity', 'equalto', 'Low')       | list | length }}"
+      when: (all_patches | length) > 0
+      tags: [report]
+
+    # Distinct CVE IDs across every pending patch on the host (any display
+    # bucket), so "are there any CVEs here at all" has a single answer
+    # without reading every package line.
+    - name: Compute total distinct CVE count
+      ansible.builtin.set_fact:
+        total_cve_count: >-
+          {{
+            (all_patches
+             | selectattr('cves', 'defined')
+             | selectattr('cves', 'ne', '')
+             | map(attribute='cves') | map('split', ',') | sum(start=[]) | unique | length)
+          }}
+        packages_with_cves: >-
+          {{
+            (all_patches
+             | selectattr('cves', 'defined')
+             | selectattr('cves', 'ne', '')
+             | list | length)
+          }}
+      when: (all_patches | length) > 0
+      tags: [report]
+
+    - name: "Patch summary: {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg:
+          - "============== PATCH SUMMARY: {{ inventory_hostname }} =================="
+          - "Security Updates   : {{ security_count }}"
+          - "Bugfix Updates     : {{ bugfix_count }}"
+          - "Enhancements       : {{ enhancement_count }}"
+          - "System Updates     : {{ system_count }}"
+          - "----------------------------------------------------------------"
+          - "Severity Critical  : {{ critical_count }}"
+          - "Severity Important : {{ important_count }}"
+          - "Severity Moderate  : {{ moderate_count }}"
+          - "Severity Low       : {{ low_count }}"
+          - "----------------------------------------------------------------"
+          - "Distinct CVEs      : {{ total_cve_count }}"
+          - "Scan duration (s)  : {{ scan_duration_seconds }}"
+          - "================================================================"
+      when: (all_patches | length) > 0
+      tags: [report]
+
+    - name: "Scan diagnostics: {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg: "{{ ['⚠ CVE/advisory data caveats for ' ~ inventory_hostname ~ ':'] + (scan_warnings | map('regex_replace', '^', '  - ') | list) }}"
+      when: (scan_warnings | default([]) | length) > 0
+      tags: [report]
+
+    - name: "Status: {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg: >-
+          {{ ('SCAN ERROR: ' ~ scan_error)
+             if scan_error
+             else ('No pending patches on ' ~ inventory_hostname) }}
+      when: (all_patches | length) == 0
+      tags: [report]
+
+    - name: "Patch detail: {{ inventory_hostname }}"
+      ansible.builtin.debug:
+        msg:
+          - "===================================================="
+          - "[{{ item.display_category }}] {{ item.name }}{{ ' (category: ' ~ item.category ~ ')' if item.category not in ['Security', 'Application'] else '' }}"
+          - "Current : {{ item.current_version }}"
+          - "New     : {{ item.new_version }}"
+          - "Severity: {{ item.severity | default('None') }}"
+          - >-
+            {% set cve_list = item.cves.split(',') if item.cves else [] %}
+            {%- if cve_list | length > 3 -%}
+            CVEs    : {{ cve_list[:3] | join(', ') }}, ... (+{{ cve_list | length - 3 }} more)
+            {%- elif cve_list -%}
+            CVEs    : {{ cve_list | join(', ') }}
+            {%- else -%}
+            CVEs    : none identified
+            {%- endif %}
+      loop: "{{ all_patches }}"
+      loop_control:
+        label: "{{ item.name }}"
+      tags: [report]
+
+    # ───────────────────────────────────────────────────────────────────────
+    # PUBLISH TO AWX — replaces the old write-JSON-then-fetch flow.
+    # set_stats(per_host: true) makes this data retrievable per-host via
+    # the AWX Job API (job artifacts / stats) with no shared filesystem
+    # dependency between the execution node and any external caller
+    # (e.g. your Flask app can just poll the AWX Job API).
+    #
+    # Also publishes lightweight execution metrics (scan_duration_seconds,
+    # packages_examined, packages_with_cves) so AWX dashboards/Workflow
+    # stats can track scan health/performance over time, not just results.
+    # ───────────────────────────────────────────────────────────────────────
+    - name: Publish patch report to AWX job stats
+      ansible.builtin.set_stats:
+        per_host: true
+        data:
+          patch_report:
+            hostname:      "{{ inventory_hostname }}"
+            ip:            "{{ ansible_host | default(inventory_hostname) }}"
+            os:            "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+            kernel:        "{{ ansible_kernel }}"
+            arch:          "{{ ansible_architecture }}"
+            scan_time:     "{{ ansible_date_time.iso8601 }}"
+            scan_duration_seconds: "{{ scan_duration_seconds | default(0) }}"
+            packages_examined: "{{ all_patches | length }}"
+            packages_with_cves: "{{ packages_with_cves | default(0) }}"
+            patch_count:   "{{ all_patches | length }}"
+            security_count:    "{{ security_count | default(0) }}"
+            bugfix_count:      "{{ bugfix_count | default(0) }}"
+            enhancement_count: "{{ enhancement_count | default(0) }}"
+            system_count:      "{{ system_count | default(0) }}"
+            critical_count:    "{{ critical_count | default(0) }}"
+            important_count:   "{{ important_count | default(0) }}"
+            moderate_count:    "{{ moderate_count | default(0) }}"
+            low_count:         "{{ low_count | default(0) }}"
+            total_cve_count:   "{{ total_cve_count | default(0) }}"
+            patches:       "{{ all_patches }}"
+            scan_error:    "{{ scan_error }}"
+            scan_warnings: "{{ scan_warnings | default([]) }}"
+      tags: [always, report]
