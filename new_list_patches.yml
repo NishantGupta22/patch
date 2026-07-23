@@ -1709,3 +1709,18 @@
           - "{{ all_patches | map(attribute='cves') | list }}"
       when: (all_patches | length) > 0
       tags: [always, report] 
+    - name: Show ONLY the real Postgres error (strips the huge data dump)
+      ansible.builtin.debug:
+        msg: "{{ pg_insert_result.msg[-600:] }}"
+      when:
+        - pg_insert_result is defined
+        - pg_insert_result is failed
+      tags: [always, report]
+
+    - name: Fail the host cleanly now that we've logged the real error
+      ansible.builtin.fail:
+        msg: "PostgreSQL insert failed for {{ inventory_hostname }} — see error above"
+      when:
+        - pg_insert_result is defined
+        - pg_insert_result is failed
+      tags: [always, report]
