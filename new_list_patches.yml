@@ -194,10 +194,79 @@
 #   reason, and both DB tasks mark their login_password argument
 #   no_log so credentials never land in the AWX job output.
 #
+# FIX N — [Postgres] scan_id/UUID mismatch (review round 4): scan_runs.
+#   scan_id is a native UUID PRIMARY KEY (DEFAULT gen_random_uuid()).
+#   The previous version inserted `tower_job_id` (a plain integer string,
+#   e.g. "142") directly into that column, which Postgres rejects with
+#   "invalid input syntax for type uuid" on every single run — so the
+#   scan_runs insert, and therefore every patch_inventory insert (which
+#   FK's to scan_id), failed 100% of the time. Fixed by letting Postgres
+#   generate the UUID (RETURNING scan_id) and threading that value
+#   through via a run_once fact (current_scan_id) instead of reusing
+#   tower_job_id as if it were a UUID. tower_job_id is still recorded,
+#   just in the `triggered_by` text column where it belongs.
+#
+# FIX O — [Postgres] cve_ids array/scalar mismatch: patch_inventory.
+#   cve_ids is TEXT[], but the scanner's `cves` field is a single
+#   comma-joined string (e.g. "CVE-2026-1,CVE-2026-2"). Passed straight
+#   into unnest() this arrives as `text`, not `text[]`, and Postgres
+#   rejects the insert ("column is of type text[] but expression is of
+#   type text"). Fixed with `string_to_array(p.cve, ',')` (mapped to
+#   '{}' for the empty-string case) inside the INSERT's SELECT.
+#
+# FIX P — [Postgres] category / display_category columns: these are now
+#   written by the INSERT but were never part of the original
+#   patch_inventory schema. See the "REQUIRED SCHEMA MIGRATION" note
+#   below — an ALTER TABLE must be run once before this playbook's DB
+#   publish step will succeed.
+#
+# FIX Q — [scanner] silent scan-failure vs "genuinely zero updates":
+#   Neither the Debian `apt-get -s dist-upgrade` simulate call nor the
+#   RHEL `check-update` call previously checked their own return code
+#   before treating an empty package list as "0 pending patches" — a
+#   real command failure (mid-scan lock contention, a crashing repo
+#   plugin, etc.) looked identical to a clean host. Both paths now emit
+#   a scan_warnings entry when the command's rc indicates failure, so
+#   "couldn't check" is never silently reported as "nothing to patch".
+#
+# FIX R — [scanner] scan-timeout budget: patch_scan_timeout (900s) previously
+#   bounded the whole scanner run, but worst-case Debian/Kali CVE fetching
+#   (up to patch_detail_limit packages, patch_cve_workers concurrency,
+#   patch_cve_timeout per lookup) could alone exceed 20+ minutes, on top
+#   of the upfront dist-upgrade/show/madison calls — meaning a heavily
+#   outdated host could be killed by the outer command timeout before it
+#   ever printed JSON, turning a slow-but-useful scan into a hard
+#   scan_error. patch_scan_timeout is raised to a value that comfortably
+#   covers the documented worst case at the default tunables; lower
+#   patch_cve_workers/patch_detail_limit if you need a tighter bound
+#   instead.
+#
+# FIX S — [AWX credential] patch_scanner_python is now
+#   {{ ansible_python.executable }} instead of a hardcoded
+#   /usr/bin/python3, matching the OS/security patch playbooks and
+#   avoiding a false failure on minimal images that ship python3 at a
+#   different path.
+#
+# FIX T — [AWX job output] the previous no_log: false on the "Record
+#   this scan run" task actively contradicted this file's own stated
+#   intent (never let credentials land in job output) even though the
+#   postgresql_query module itself marks login_password no_log under
+#   the hood. Removed; both DB tasks now behave identically and neither
+#   explicitly disables no_log.
+#
 # (All other design notes from the original bulk-scanner are unchanged:
 #  apt-cache policy for authoritative Debian versions, dnf/yum
 #  check-update section-aware parsing, distro-aware branching for
 #  Kali/Amazon/Oracle, always-valid-JSON scanner output, etc.)
+#
+# REQUIRED SCHEMA MIGRATION (run once, before this playbook publishes to
+# Postgres) — adds the two columns FIX P now writes to:
+#
+#   ALTER TABLE patch_inventory
+#     ADD COLUMN IF NOT EXISTS category         TEXT,
+#     ADD COLUMN IF NOT EXISTS display_category  TEXT;
+#   CREATE INDEX IF NOT EXISTS idx_patch_display_category
+#     ON patch_inventory (display_category);
 #
 # KNOWN LIMITATIONS (best-effort, not authoritative):
 #   - "Security" classification is heuristic for Debian (apt -security
@@ -224,7 +293,8 @@
 #     — preferably — a Custom Credential Type injected as extra vars),
 #     and the `community.postgresql` collection plus its Python driver
 #     (psycopg2 or psycopg) must be present in the Execution Environment
-#     image the Job Template runs in.
+#     image the Job Template runs in. The schema migration above must
+#     also have been applied.
 #
 # Per-host stat schema (available via AWX job stats/artifacts):
 #   patch_report: { hostname, ip, os, kernel, arch, scan_time,
@@ -264,8 +334,24 @@
     patch_fetch_cves:     true   # set false on air-gapped hosts (avoids apt-get changelog)
     patch_cve_timeout:    20     # seconds per apt-get changelog lookup (network-bound; FIX E)
     patch_cve_workers:    8      # concurrent CVE lookup workers, Debian only (FIX E)
-    patch_scan_timeout:   900    # seconds; generous cap for metadata refresh + scan
-    patch_scanner_python: "/usr/bin/python3"
+    # FIX R: raised from 900s. Worst case at default tunables is roughly
+    # ceil(patch_detail_limit / patch_cve_workers) * patch_cve_timeout
+    # for the CVE thread pool alone (~1250s at the defaults above), on
+    # top of the upfront dist-upgrade/show/madison calls (~480s worst
+    # case). 2400s gives headroom above that combined worst case rather
+    # than killing a slow-but-useful scan partway through. Lower
+    # patch_cve_workers/patch_detail_limit instead if you need a
+    # tighter bound than this.
+    patch_scan_timeout:   2400   # seconds; generous cap for metadata refresh + scan
+    # FIX S: was hardcoded /usr/bin/python3. ansible_python.executable
+    # matches what the OS/security patch playbooks already do and
+    # survives minimal images that ship python3 at a non-standard path.
+    patch_scanner_python: "{{ ansible_python.executable }}"
+    # FIX (job output bloat): gate the very verbose per-package debug
+    # loop behind a var so a large pending set doesn't flood the AWX
+    # job output/event table. Full per-package detail is always
+    # available via set_stats regardless of this setting.
+    patch_verbose_output: false
 
   tasks:
 
@@ -521,6 +607,11 @@
                        is now parsed and reported per package, from the
                        same two calls FIX K already makes — nothing
                        hardcoded, nothing extra fetched.
+              FIX Q — the simulate-upgrade (Debian) / check-update (RHEL)
+                       return codes are now checked before treating an
+                       empty package list as "genuinely zero updates" —
+                       a real command failure now produces a scan_warnings
+                       entry instead of looking identical to a clean host.
 
               Always exits 0 and prints valid JSON (possibly an empty
               patches list), even on unexpected errors, so the calling
@@ -773,6 +864,15 @@
                       ],
                       timeout=300,
                   )
+                  # FIX Q — a real command failure previously looked identical
+                  # to "genuinely zero pending patches". Surface it explicitly.
+                  if rc != 0:
+                      warnings.append(
+                          f"apt-get -s dist-upgrade exited rc={rc} — the pending-patch "
+                          "list below may be incomplete or empty even though real "
+                          "updates could exist. Common causes: lock contention that "
+                          "outlasted retries, or a broken/incompatible repo entry."
+                      )
                   pkgs = sorted(
                       {
                           line.split()[1]
@@ -1293,7 +1393,17 @@
                       )
 
                   rc, out, _ = run([mgr, "-q", "check-update"], timeout=600)
+                  # FIX Q — dnf/yum check-update uses rc 100 to mean "updates
+                  # ARE available" (not a failure) and rc 0 to mean "no updates,
+                  # ran cleanly". Any other rc is a genuine command failure and
+                  # must not be silently treated as "0 pending patches".
                   if rc not in (0, 100):
+                      warnings.append(
+                          f"'{mgr} check-update' exited rc={rc} — the pending-patch list "
+                          "below may be incomplete or empty even though real updates "
+                          "could exist. Common causes: repo/plugin failure, network "
+                          "issue, or a broken dnf/yum transaction."
+                      )
                       return [], warnings
 
                   pkgs = parse_check_update(out)
@@ -1618,6 +1728,10 @@
       when: (all_patches | length) == 0
       tags: [report]
 
+    # FIX (job output bloat): gated behind patch_verbose_output. Full
+    # per-package detail is always available via set_stats/AWX job API
+    # regardless of this setting -- this loop only controls how much
+    # gets duplicated into the human-readable job output/event log.
     - name: "Patch detail: {{ inventory_hostname }}"
       ansible.builtin.debug:
         msg:
@@ -1638,6 +1752,7 @@
       loop: "{{ all_patches }}"
       loop_control:
         label: "{{ item.name }}"
+      when: patch_verbose_output | bool
       tags: [report]
 
     # ───────────────────────────────────────────────────────────────────────
@@ -1691,14 +1806,24 @@
     # register, so those two tasks checked an undefined variable and
     # were always skipped, and a real DB failure would have hard-stopped
     # the host on Ansible's raw (often huge) error before ever reaching
-    # them. login_password is marked no_log so credentials never appear
-    # in the AWX job output.
+    # them.
+    #
+    # FIX N: scan_runs.scan_id is a native UUID PRIMARY KEY
+    # (DEFAULT gen_random_uuid()). Previously this task inserted
+    # tower_job_id directly as if it WERE a uuid, which Postgres rejects
+    # on every run ("invalid input syntax for type uuid"), which in turn
+    # failed every patch_inventory insert since it FK's to scan_id. Now
+    # the INSERT lets Postgres generate the UUID and RETURNING hands it
+    # back; tower_job_id is recorded in triggered_by (a TEXT column)
+    # instead, where it always belonged.
     #
     # Requires (must be supplied by AWX -- extra vars, a survey, or,
     # preferably, a Custom Credential Type injected as extra vars):
     #   pg_host_var, pg_user_var, pg_password_var
     # Requires the `community.postgresql` collection + psycopg2/psycopg
-    # to be present in the Execution Environment image the job runs in.
+    # to be present in the Execution Environment image the job runs in,
+    # AND the schema migration noted near the top of this file (adds
+    # patch_inventory.category / display_category -- FIX P).
     # ───────────────────────────────────────────────────────────────────────
     - name: Record this scan run (safe if multiple hosts race on this)
       run_once: true
@@ -1707,18 +1832,16 @@
       register: pg_scanrun_result
       failed_when: false
       ignore_errors: true
-      no_log: false
       community.postgresql.postgresql_query:
         login_host: "{{ pg_host_var }}"
         login_db: patch_management
         login_user: "{{ pg_user_var }}"
         login_password: "{{ pg_password_var }}"
         query: >
-          INSERT INTO scan_runs (scan_id, triggered_by, inventory)
-          VALUES (%s, %s, %s)
-          ON CONFLICT (scan_id) DO NOTHING
+          INSERT INTO scan_runs (triggered_by, inventory)
+          VALUES (%s, %s)
+          RETURNING scan_id
         positional_args:
-          - "{{ tower_job_id | default(ansible_date_time.epoch) }}"
           - "AWX Job {{ tower_job_id | default('manual') }}"
           - "{{ ansible_limit | default('all') }}"
       tags: [always, report]
@@ -1730,6 +1853,29 @@
         - pg_scanrun_result is defined
         - pg_scanrun_result is failed
       run_once: true
+      tags: [always, report]
+
+    # FIX N: capture the server-generated UUID once (run_once facts
+    # persist across hosts for the rest of this play), so every host's
+    # patch_inventory insert below references a real, valid scan_id
+    # instead of reusing tower_job_id as if it were one.
+    - name: Store the generated scan_id for this run
+      run_once: true
+      ansible.builtin.set_fact:
+        current_scan_id: "{{ pg_scanrun_result.query_result[0].scan_id }}"
+      when:
+        - pg_scanrun_result is defined
+        - pg_scanrun_result is succeeded
+        - pg_scanrun_result.query_result is defined
+        - (pg_scanrun_result.query_result | length) > 0
+      tags: [always, report]
+
+    - name: Skip patch_inventory insert if no scan_id was obtained
+      ansible.builtin.set_fact:
+        scan_warnings: "{{ (scan_warnings | default([])) + ['No scan_id available -- scan_runs insert failed or returned no row, so this host\\'s patches were not published to PostgreSQL.'] }}"
+      when:
+        - current_scan_id is not defined
+        - (all_patches | length) > 0
       tags: [always, report]
 
     - name: Save this host's patches to PostgreSQL
@@ -1747,13 +1893,14 @@
           INSERT INTO patch_inventory
           (scan_id, hostname, os_family, package_name, current_version, available_version,
            repository, category, display_category, severity, cve_ids, is_security, is_kernel)
-          SELECT %s, %s, %s, p.name, p.cur, p.new, p.org, p.cat, p.disp, p.sev, p.cve,
+          SELECT %s, %s, %s, p.name, p.cur, p.new, p.org, p.cat, p.disp, p.sev,
+                 CASE WHEN p.cve = '' THEN '{}'::text[] ELSE string_to_array(p.cve, ',') END,
                  (p.disp = 'SECURITY'), (p.cat = 'Kernel')
           FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[],
                       %s::text[], %s::text[], %s::text[], %s::text[])
                AS p(name, cur, new, org, cat, disp, sev, cve)
         positional_args:
-          - "{{ tower_job_id | default(ansible_date_time.epoch) }}"
+          - "{{ current_scan_id }}"
           - "{{ inventory_hostname }}"
           - "{{ ansible_os_family }}"
           - "{{ all_patches | map(attribute='name') | list }}"
@@ -1764,7 +1911,9 @@
           - "{{ all_patches | map(attribute='display_category') | list }}"
           - "{{ all_patches | map(attribute='severity') | list }}"
           - "{{ all_patches | map(attribute='cves') | list }}"
-      when: (all_patches | length) > 0
+      when:
+        - (all_patches | length) > 0
+        - current_scan_id is defined
       tags: [always, report]
 
     - name: Show ONLY the real Postgres error (strips the huge data dump)
