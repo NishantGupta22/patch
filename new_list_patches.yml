@@ -1872,7 +1872,11 @@
 
     - name: Skip patch_inventory insert if no scan_id was obtained
       ansible.builtin.set_fact:
-        scan_warnings: "{{ (scan_warnings | default([])) + ['No scan_id available -- scan_runs insert failed or returned no row, so this host\\'s patches were not published to PostgreSQL.'] }}"
+        scan_warnings: "{{ (scan_warnings | default([])) + [skip_insert_warning_text] }}"
+      vars:
+        skip_insert_warning_text: >-
+          No scan_id available -- scan_runs insert failed or returned no row,
+          so patches for this host were not published to PostgreSQL.
       when:
         - current_scan_id is not defined
         - (all_patches | length) > 0
