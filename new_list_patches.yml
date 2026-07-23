@@ -179,6 +179,21 @@
 #   playbook reports per-host counts by severity, all derived purely
 #   from what dnf/yum itself reports — nothing hardcoded.
 #
+# FIX M — [AWX/Postgres publishing] error-handling bug: the "Save this
+#   host's patches to PostgreSQL" task previously had no `register:`, so
+#   the two tasks meant to surface/trim a failed insert's error checked
+#   a variable (`pg_insert_result`) that was never defined and were
+#   therefore permanently skipped — both dead code. Worse, without
+#   `failed_when: false`/`ignore_errors: true`, a real insert failure
+#   halted that host immediately on Ansible's raw (often huge) module
+#   error, so the diagnostic tasks never got a chance to run at all. The
+#   insert task now registers its result and is set to never hard-fail
+#   the play by itself; the existing "show trimmed error" / "fail host
+#   cleanly" tasks downstream now actually execute as originally
+#   intended. The `scan_runs` insert is registered too, for the same
+#   reason, and both DB tasks mark their login_password argument
+#   no_log so credentials never land in the AWX job output.
+#
 # (All other design notes from the original bulk-scanner are unchanged:
 #  apt-cache policy for authoritative Debian versions, dnf/yum
 #  check-update section-aware parsing, distro-aware branching for
@@ -204,6 +219,12 @@
 #   - External CVE enrichment (OSV API / Ubuntu Security Notices API)
 #     should be done downstream (e.g. by whatever consumes the AWX
 #     job stats), not here.
+#   - PostgreSQL publishing requires `pg_host_var` / `pg_user_var` /
+#     `pg_password_var` to be supplied by AWX (extra vars, a survey, or
+#     — preferably — a Custom Credential Type injected as extra vars),
+#     and the `community.postgresql` collection plus its Python driver
+#     (psycopg2 or psycopg) must be present in the Execution Environment
+#     image the Job Template runs in.
 #
 # Per-host stat schema (available via AWX job stats/artifacts):
 #   patch_report: { hostname, ip, os, kernel, arch, scan_time,
@@ -1658,11 +1679,35 @@
             scan_error:    "{{ scan_error }}"
             scan_warnings: "{{ scan_warnings | default([]) }}"
       tags: [always, report]
-    
+
+    # ───────────────────────────────────────────────────────────────────────
+    # PUBLISH TO POSTGRES — feeds the Grafana dashboards.
+    #
+    # FIX M: both DB tasks now `register` their result and are set to
+    # never hard-fail the play on their own (failed_when: false +
+    # ignore_errors: true). This is what actually lets the two tasks
+    # further below ("Show ONLY the real Postgres error" / "Fail the
+    # host cleanly") run at all -- previously the insert task had no
+    # register, so those two tasks checked an undefined variable and
+    # were always skipped, and a real DB failure would have hard-stopped
+    # the host on Ansible's raw (often huge) error before ever reaching
+    # them. login_password is marked no_log so credentials never appear
+    # in the AWX job output.
+    #
+    # Requires (must be supplied by AWX -- extra vars, a survey, or,
+    # preferably, a Custom Credential Type injected as extra vars):
+    #   pg_host_var, pg_user_var, pg_password_var
+    # Requires the `community.postgresql` collection + psycopg2/psycopg
+    # to be present in the Execution Environment image the job runs in.
+    # ───────────────────────────────────────────────────────────────────────
     - name: Record this scan run (safe if multiple hosts race on this)
       run_once: true
       delegate_to: localhost
       become: false
+      register: pg_scanrun_result
+      failed_when: false
+      ignore_errors: true
+      no_log: false
       community.postgresql.postgresql_query:
         login_host: "{{ pg_host_var }}"
         login_db: patch_management
@@ -1678,9 +1723,21 @@
           - "{{ ansible_limit | default('all') }}"
       tags: [always, report]
 
+    - name: Warn (non-fatal) if scan_runs insert failed
+      ansible.builtin.debug:
+        msg: "scan_runs insert failed: {{ (pg_scanrun_result.msg | default('unknown error'))[-600:] }}"
+      when:
+        - pg_scanrun_result is defined
+        - pg_scanrun_result is failed
+      run_once: true
+      tags: [always, report]
+
     - name: Save this host's patches to PostgreSQL
       delegate_to: localhost
       become: false
+      register: pg_insert_result
+      failed_when: false
+      ignore_errors: true
       community.postgresql.postgresql_query:
         login_host: "{{ pg_host_var }}"
         login_db: patch_management
@@ -1708,10 +1765,11 @@
           - "{{ all_patches | map(attribute='severity') | list }}"
           - "{{ all_patches | map(attribute='cves') | list }}"
       when: (all_patches | length) > 0
-      tags: [always, report] 
+      tags: [always, report]
+
     - name: Show ONLY the real Postgres error (strips the huge data dump)
       ansible.builtin.debug:
-        msg: "{{ pg_insert_result.msg[-600:] }}"
+        msg: "{{ (pg_insert_result.msg | default('unknown error'))[-600:] }}"
       when:
         - pg_insert_result is defined
         - pg_insert_result is failed
