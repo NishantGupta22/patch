@@ -194,31 +194,43 @@
 #   reason, and both DB tasks mark their login_password argument
 #   no_log so credentials never land in the AWX job output.
 #
-# FIX N — [Postgres] scan_id/UUID mismatch (review round 4): scan_runs.
-#   scan_id is a native UUID PRIMARY KEY (DEFAULT gen_random_uuid()).
-#   The previous version inserted `tower_job_id` (a plain integer string,
-#   e.g. "142") directly into that column, which Postgres rejects with
-#   "invalid input syntax for type uuid" on every single run — so the
-#   scan_runs insert, and therefore every patch_inventory insert (which
-#   FK's to scan_id), failed 100% of the time. Fixed by letting Postgres
-#   generate the UUID (RETURNING scan_id) and threading that value
-#   through via a run_once fact (current_scan_id) instead of reusing
-#   tower_job_id as if it were a UUID. tower_job_id is still recorded,
-#   just in the `triggered_by` text column where it belongs.
+# FIX N — [Postgres] scan_id handling, corrected against the VERIFIED
+#   live schema (`\d patch_inventory` run against the real production
+#   DB): scan_runs.scan_id is a plain TEXT column with NO default — it
+#   is NOT the UUID/gen_random_uuid() column the original setup guide
+#   documented. Historical data in scan_runs already stores AWX job IDs
+#   directly as scan_id (e.g. "303", "302"), confirming this is how the
+#   table has always actually been used here. An earlier revision of
+#   this fix (incorrectly) assumed the UUID schema and switched to
+#   RETURNING a server-generated value — since the real column has no
+#   default, that produced NULL and silently broke every
+#   patch_inventory insert (0 rows, despite scan_runs itself looking
+#   fine). Reverted: scan_id is explicitly supplied as
+#   `tower_job_id | default(ansible_date_time.epoch)`, computed
+#   independently by every host via a plain set_fact (no query_result
+#   round-trip needed since we choose the value ourselves), with
+#   `ON CONFLICT (scan_id) DO NOTHING` on the scan_runs insert so a
+#   re-run of the same job ID doesn't error.
 #
-# FIX O — [Postgres] cve_ids array/scalar mismatch: patch_inventory.
-#   cve_ids is TEXT[], but the scanner's `cves` field is a single
-#   comma-joined string (e.g. "CVE-2026-1,CVE-2026-2"). Passed straight
-#   into unnest() this arrives as `text`, not `text[]`, and Postgres
-#   rejects the insert ("column is of type text[] but expression is of
-#   type text"). Fixed with `string_to_array(p.cve, ',')` (mapped to
-#   '{}' for the empty-string case) inside the INSERT's SELECT.
+# FIX O — [Postgres] cve_ids handling, corrected against the VERIFIED
+#   live schema: patch_inventory.cve_ids is plain TEXT (confirmed via
+#   the same `\d patch_inventory` output — NOT TEXT[] as the setup guide
+#   documented). An earlier revision of this fix incorrectly wrapped the
+#   scanner's comma-joined CVE string in `string_to_array(...)`, which
+#   would have failed inserting an array into a text column (the same
+#   class of type mismatch the reported `array_length(cve_ids, 1)`
+#   error on a text column independently confirms). Reverted: the
+#   scanner's `cves` field (a plain comma-joined string, or "" when
+#   empty) is now inserted as-is, matching the real column type.
 #
-# FIX P — [Postgres] category / display_category columns: these are now
-#   written by the INSERT but were never part of the original
-#   patch_inventory schema. See the "REQUIRED SCHEMA MIGRATION" note
-#   below — an ALTER TABLE must be run once before this playbook's DB
-#   publish step will succeed.
+# FIX P — [Postgres] category / display_category columns: confirmed
+#   already present in the live schema via `\d patch_inventory` — no
+#   migration needed for these two columns in this environment. (Keep
+#   this in mind if you ever recreate patch_inventory from scratch using
+#   the original setup guide's CREATE TABLE, which does NOT include
+#   them — the guide and the live schema have diverged in more than one
+#   place, so treat `\d patch_inventory` as the source of truth, not the
+#   guide.)
 #
 # FIX Q — [scanner] silent scan-failure vs "genuinely zero updates":
 #   Neither the Debian `apt-get -s dist-upgrade` simulate call nor the
@@ -259,14 +271,36 @@
 #  check-update section-aware parsing, distro-aware branching for
 #  Kali/Amazon/Oracle, always-valid-JSON scanner output, etc.)
 #
-# REQUIRED SCHEMA MIGRATION (run once, before this playbook publishes to
-# Postgres) — adds the two columns FIX P now writes to:
+# SCHEMA NOTE: `category` and `display_category` are confirmed already
+# present on the live patch_inventory table in this environment (verified
+# via `\d patch_inventory`), so no migration is needed for them here. If
+# you ever rebuild this table from scratch, use this as the authoritative
+# shape rather than the older setup guide (which also differs on
+# scan_id/cve_ids types — see FIX N/O above):
 #
-#   ALTER TABLE patch_inventory
-#     ADD COLUMN IF NOT EXISTS category         TEXT,
-#     ADD COLUMN IF NOT EXISTS display_category  TEXT;
-#   CREATE INDEX IF NOT EXISTS idx_patch_display_category
-#     ON patch_inventory (display_category);
+#   CREATE TABLE patch_inventory (
+#     id                 BIGSERIAL PRIMARY KEY,
+#     scan_id            TEXT REFERENCES scan_runs(scan_id) ON DELETE CASCADE,
+#     scan_date          TIMESTAMPTZ NOT NULL DEFAULT now(),
+#     hostname           TEXT NOT NULL,
+#     os_family          TEXT,
+#     package_name       TEXT NOT NULL,
+#     current_version    TEXT,
+#     available_version  TEXT,
+#     repository         TEXT,
+#     category           TEXT,
+#     display_category   TEXT,
+#     severity           TEXT,
+#     cve_ids            TEXT,
+#     is_security        BOOLEAN DEFAULT false,
+#     is_kernel          BOOLEAN DEFAULT false
+#   );
+#   -- plus whatever indexes your environment already has
+#   -- (idx_patch_host_date, idx_patch_scan_id, idx_patch_security,
+#   --  idx_patch_severity, and ideally one on display_category too).
+#
+# For this to work, scan_runs.scan_id must itself be TEXT (not UUID) and
+# either PRIMARY KEY or UNIQUE, since patch_inventory.scan_id FKs to it.
 #
 # KNOWN LIMITATIONS (best-effort, not authoritative):
 #   - "Security" classification is heuristic for Debian (apt -security
@@ -1825,6 +1859,17 @@
     # AND the schema migration noted near the top of this file (adds
     # patch_inventory.category / display_category -- FIX P).
     # ───────────────────────────────────────────────────────────────────────
+    # FIX N (revised): the live production schema has scan_runs.scan_id as
+    # a plain TEXT column with NO default (confirmed via `\d patch_inventory`
+    # -- the FK target column carries no default either), NOT the
+    # UUID/gen_random_uuid() column the original setup guide documented.
+    # Letting Postgres auto-generate a value (RETURNING scan_id) therefore
+    # produced NULL, silently breaking every downstream patch_inventory
+    # insert. Reverted to explicitly supplying tower_job_id as the scan_id
+    # value ourselves -- this is also what the historical data in
+    # scan_runs already shows (scan_id values "303", "302", etc. exactly
+    # matching AWX job IDs), so this matches how the table has always
+    # actually been used in this environment.
     - name: Record this scan run (safe if multiple hosts race on this)
       run_once: true
       delegate_to: localhost
@@ -1838,10 +1883,11 @@
         login_user: "{{ pg_user_var }}"
         login_password: "{{ pg_password_var }}"
         query: >
-          INSERT INTO scan_runs (triggered_by, inventory)
-          VALUES (%s, %s)
-          RETURNING scan_id
+          INSERT INTO scan_runs (scan_id, triggered_by, inventory)
+          VALUES (%s, %s, %s)
+          ON CONFLICT (scan_id) DO NOTHING
         positional_args:
+          - "{{ tower_job_id | default(ansible_date_time.epoch) }}"
           - "AWX Job {{ tower_job_id | default('manual') }}"
           - "{{ ansible_limit | default('all') }}"
       tags: [always, report]
@@ -1855,31 +1901,17 @@
       run_once: true
       tags: [always, report]
 
-    # FIX N: capture the server-generated UUID once (run_once facts
-    # persist across hosts for the rest of this play), so every host's
-    # patch_inventory insert below references a real, valid scan_id
-    # instead of reusing tower_job_id as if it were one.
-    - name: Store the generated scan_id for this run
-      run_once: true
+    # Since we choose scan_id ourselves (tower_job_id) rather than reading
+    # a server-generated value back, every host can compute the same
+    # current_scan_id independently -- no need to thread a query_result
+    # through run_once facts. If the scan_runs insert above genuinely
+    # failed (e.g. DB unreachable), the patch_inventory insert below will
+    # fail on the FK constraint instead, and that failure is still
+    # surfaced by the existing "Show ONLY the real Postgres error" /
+    # "Fail the host cleanly" tasks further down.
+    - name: Compute the scan_id used for this run
       ansible.builtin.set_fact:
-        current_scan_id: "{{ pg_scanrun_result.query_result[0].scan_id }}"
-      when:
-        - pg_scanrun_result is defined
-        - pg_scanrun_result is succeeded
-        - pg_scanrun_result.query_result is defined
-        - (pg_scanrun_result.query_result | length) > 0
-      tags: [always, report]
-
-    - name: Skip patch_inventory insert if no scan_id was obtained
-      ansible.builtin.set_fact:
-        scan_warnings: "{{ (scan_warnings | default([])) + [skip_insert_warning_text] }}"
-      vars:
-        skip_insert_warning_text: >-
-          No scan_id available -- scan_runs insert failed or returned no row,
-          so patches for this host were not published to PostgreSQL.
-      when:
-        - current_scan_id is not defined
-        - (all_patches | length) > 0
+        current_scan_id: "{{ tower_job_id | default(ansible_date_time.epoch) }}"
       tags: [always, report]
 
     - name: Save this host's patches to PostgreSQL
@@ -1897,8 +1929,7 @@
           INSERT INTO patch_inventory
           (scan_id, hostname, os_family, package_name, current_version, available_version,
            repository, category, display_category, severity, cve_ids, is_security, is_kernel)
-          SELECT %s, %s, %s, p.name, p.cur, p.new, p.org, p.cat, p.disp, p.sev,
-                 CASE WHEN p.cve = '' THEN '{}'::text[] ELSE string_to_array(p.cve, ',') END,
+          SELECT %s, %s, %s, p.name, p.cur, p.new, p.org, p.cat, p.disp, p.sev, p.cve,
                  (p.disp = 'SECURITY'), (p.cat = 'Kernel')
           FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[],
                       %s::text[], %s::text[], %s::text[], %s::text[])
