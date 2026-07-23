@@ -1658,3 +1658,52 @@
             scan_error:    "{{ scan_error }}"
             scan_warnings: "{{ scan_warnings | default([]) }}"
       tags: [always, report]
+    
+    - name: Record this scan run (safe if multiple hosts race on this)
+      run_once: true
+      delegate_to: localhost
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host_var }}"
+        login_db: patch_management
+        login_user: "{{ pg_user_var }}"
+        login_password: "{{ pg_password_var }}"
+        query: >
+          INSERT INTO scan_runs (scan_id, triggered_by, inventory)
+          VALUES (%s, %s, %s)
+          ON CONFLICT (scan_id) DO NOTHING
+        positional_args:
+          - "{{ tower_job_id | default(ansible_date_time.epoch) }}"
+          - "AWX Job {{ tower_job_id | default('manual') }}"
+          - "{{ ansible_limit | default('all') }}"
+      tags: [always, report]
+
+    - name: Save this host's patches to PostgreSQL
+      delegate_to: localhost
+      community.postgresql.postgresql_query:
+        login_host: "{{ pg_host_var }}"
+        login_db: patch_management
+        login_user: "{{ pg_user_var }}"
+        login_password: "{{ pg_password_var }}"
+        query: >
+          INSERT INTO patch_inventory
+          (scan_id, hostname, os_family, package_name, current_version, available_version,
+           repository, category, display_category, severity, cve_ids, is_security, is_kernel)
+          SELECT %s, %s, %s, p.name, p.cur, p.new, p.org, p.cat, p.disp, p.sev, p.cve,
+                 (p.disp = 'SECURITY'), (p.cat = 'Kernel')
+          FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[],
+                      %s::text[], %s::text[], %s::text[], %s::text[])
+               AS p(name, cur, new, org, cat, disp, sev, cve)
+        positional_args:
+          - "{{ tower_job_id | default(ansible_date_time.epoch) }}"
+          - "{{ inventory_hostname }}"
+          - "{{ ansible_os_family }}"
+          - "{{ all_patches | map(attribute='name') | list }}"
+          - "{{ all_patches | map(attribute='current_version') | list }}"
+          - "{{ all_patches | map(attribute='new_version') | list }}"
+          - "{{ all_patches | map(attribute='origin') | list }}"
+          - "{{ all_patches | map(attribute='category') | list }}"
+          - "{{ all_patches | map(attribute='display_category') | list }}"
+          - "{{ all_patches | map(attribute='severity') | list }}"
+          - "{{ all_patches | map(attribute='cves') | list }}"
+      when: (all_patches | length) > 0
+      tags: [always, report] 
