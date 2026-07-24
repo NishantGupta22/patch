@@ -1927,9 +1927,9 @@
         login_password: "{{ pg_password_var }}"
         query: >
           INSERT INTO patch_inventory
-          (scan_id, hostname, os_family, package_name, current_version, available_version,
+          (scan_id, hostname, os_family, os_display, package_name, current_version, available_version,
            repository, category, display_category, severity, cve_ids, is_security, is_kernel)
-          SELECT %s, %s, %s,
+          SELECT %s, %s, %s, %s,
                  p.name, p.current_version, p.new_version, p.origin,
                  p.category, p.display_category, p.severity, p.cves,
                  (p.display_category = 'SECURITY'), (p.category = 'Kernel')
@@ -1943,6 +1943,7 @@
           - "{{ current_scan_id }}"
           - "{{ inventory_hostname }}"
           - "{{ ansible_os_family }}"
+          - "{{ ansible_distribution }} {{ ansible_distribution_version }}"
           - "{{ all_patches | to_json }}"
       when:
         - (all_patches | length) > 0
