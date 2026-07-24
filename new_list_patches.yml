@@ -1929,40 +1929,21 @@
           INSERT INTO patch_inventory
           (scan_id, hostname, os_family, package_name, current_version, available_version,
            repository, category, display_category, severity, cve_ids, is_security, is_kernel)
-          SELECT %s, %s, %s, p.name, p.cur, p.new, p.org, p.cat, p.disp, p.sev, p.cve,
-                 (p.disp = 'SECURITY'), (p.cat = 'Kernel')
-          FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[],
-                      %s::text[], %s::text[], %s::text[], %s::text[])
-               AS p(name, cur, new, org, cat, disp, sev, cve)
+          SELECT %s, %s, %s,
+                 p.name, p.current_version, p.new_version, p.origin,
+                 p.category, p.display_category, p.severity, p.cves,
+                 (p.display_category = 'SECURITY'), (p.category = 'Kernel')
+          FROM jsonb_to_recordset(%s::jsonb) AS p(
+                 name text, current_version text, new_version text, origin text,
+                 size_kb text, description text, category text, display_category text,
+                 security_source text, severity text, cves text
+               )
+          WHERE p.name IS NOT NULL AND p.name <> ''
         positional_args:
           - "{{ current_scan_id }}"
           - "{{ inventory_hostname }}"
           - "{{ ansible_os_family }}"
-          - "{{ all_patches | map(attribute='name') | list }}"
-          - "{{ all_patches | map(attribute='current_version') | list }}"
-          - "{{ all_patches | map(attribute='new_version') | list }}"
-          - "{{ all_patches | map(attribute='origin') | list }}"
-          - "{{ all_patches | map(attribute='category') | list }}"
-          - "{{ all_patches | map(attribute='display_category') | list }}"
-          - "{{ all_patches | map(attribute='severity') | list }}"
-          - "{{ all_patches | map(attribute='cves') | list }}"
+          - "{{ all_patches | to_json }}"
       when:
         - (all_patches | length) > 0
         - current_scan_id is defined
-      tags: [always, report]
-
-    - name: Show ONLY the real Postgres error (strips the huge data dump)
-      ansible.builtin.debug:
-        msg: "{{ (pg_insert_result.msg | default('unknown error'))[-600:] }}"
-      when:
-        - pg_insert_result is defined
-        - pg_insert_result is failed
-      tags: [always, report]
-
-    - name: Fail the host cleanly now that we've logged the real error
-      ansible.builtin.fail:
-        msg: "PostgreSQL insert failed for {{ inventory_hostname }} — see error above"
-      when:
-        - pg_insert_result is defined
-        - pg_insert_result is failed
-      tags: [always, report]
